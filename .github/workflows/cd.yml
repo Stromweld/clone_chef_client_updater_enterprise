@@ -1,0 +1,17 @@
+---
+"on":
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  supermarket-deploy:
+    uses: chef/github-workflows/.github/workflows/cookbook-supermarket-deploy.yml@main
+    secrets: inherit
+    with:
+      SUPERMARKET_USER: "chef"
+      SUPERMARKET_URL: "https://supermarket.chef.io"

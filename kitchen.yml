@@ -1,0 +1,72 @@
+---
+driver:
+  name: vagrant
+
+provisioner:
+  name: chef_infra
+  chef_license: accept-no-persist
+  retry_on_exit_code:
+    - 213
+  max_retries: 1
+  wait_for_retry: 1
+  attributes:
+    chef_client_updater_enterprise:
+      license_key: <%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>
+
+verifier:
+  name: inspec
+
+platforms:
+  - name: almalinux-9
+    driver:
+      box: bento/almalinux-9
+      box_version: 202511.24.0
+  - name: ubuntu-2404
+    driver:
+      box: bento/ubuntu-24.04
+  - name: windows-2022
+    driver:
+      box: stromweld/windows-2022
+      customize:
+        memory: 4096
+    transport:
+      name: winrm
+    provisioner:
+      product_name: chef
+      product_version: 18
+
+suites:
+  - name: preserve-omnibus
+    provisioner:
+      named_run_list: preserve_omnibus
+      product_name: chef
+      product_version: 18
+    verifier:
+      inspec_tests:
+        - test/integration/preserve-omnibus
+      inputs:
+        expected_chef_ice_version: '19.3.15'
+
+  - name: remove-omnibus
+    provisioner:
+      named_run_list: remove_omnibus
+      multiple_converge: 2
+      product_name: chef
+      product_version: 18
+    verifier:
+      inspec_tests:
+        - test/integration/remove-omnibus
+      inputs:
+        expected_chef_ice_version: '19.3.15'
+
+  - name: multi-version
+    provisioner:
+      named_run_list: multi_version
+      product_name: chef-ice
+      product_version: 19.2.12
+    verifier:
+      inspec_tests:
+        - test/integration/multi-version
+      inputs:
+        expected_chef_ice_version: '19.3.15'
+        older_chef_ice_version: '19.2.12'

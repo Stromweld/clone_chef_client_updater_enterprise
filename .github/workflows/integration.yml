@@ -1,0 +1,35 @@
+---
+"on":
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    env:
+      KITCHEN_LOCAL_YAML: kitchen.dokken.yml
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os:
+          - almalinux-9
+          - almalinux-10
+          - ubuntu-2404
+          - ubuntu-2604
+        suite:
+          - default
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Install Chef
+        uses: actionshub/chef-install@main
+      - name: Kitchen Test
+        run: |
+          kitchen verify ${{ matrix.suite }}-${{ matrix.os }}

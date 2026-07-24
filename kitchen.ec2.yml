@@ -1,0 +1,36 @@
+---
+driver:
+  name: ec2
+  region: us-west-2
+  subnet_id: subnet-044d7de3548d5a434
+  security_group_ids: sg-0a3cefebf4dfe4fda
+  instance_type: t3a.large
+  retryable_tries: 120
+  associate_public_ip: true
+  ebs_optimized: true
+  block_device_mappings:
+    - device_name: /dev/sda1
+      ebs:
+        volume_type: gp3
+        volume_size: 200
+        delete_on_termination: true
+  shared_credentials_profile: saml
+  skip_cost_warning: true
+  tags:
+    Created-By: Test Kitchen
+
+platforms:
+  - name: rhel-9
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-rhel-9
+
+  - name: ubuntu-24.04
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-ubuntu-24.04
+
+  - name: windows-2022
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-windows-2022
