@@ -7,10 +7,6 @@ provisioner:
   product_name: chef
   product_version: 18
   chef_license: accept-no-persist
-  retry_on_exit_code:
-    - 213
-  max_retries: 1
-  wait_for_retry: 1
   attributes:
     chef_client_updater_enterprise:
       license_key: <%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>

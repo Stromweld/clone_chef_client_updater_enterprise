@@ -17,6 +17,11 @@ jobs:
         uses: actions/checkout@v6
       - name: Install Chef
         uses: actionshub/chef-install@main
+        with:
+          license: ${{ vars.CHEF_LICENSE_KEY }}
+          chefDownloadUrl: chefdownload-commercial.chef.io
+          project: chef-workstation-enterprise
+          version: latest
       - name: Cook Style
         run: cookstyle
 
