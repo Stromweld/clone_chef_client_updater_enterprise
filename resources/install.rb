@@ -108,13 +108,14 @@ action_class do
     require 'mixlib/install'
 
     product_version = new_resource.version == 'latest' ? :latest : new_resource.version
+    mixlib_platform, mixlib_platform_version = mixlib_install_platform_info
     options = {
       product_name: new_resource.product_name,
       product_version: product_version,
       channel: new_resource.channel,
       license_id: new_resource.license_key,
-      platform: node['platform'],
-      platform_version: node['platform_version'],
+      platform: mixlib_platform,
+      platform_version: mixlib_platform_version,
       architecture: node['kernel']['machine'] == 'arm64' ? 'aarch64' : node['kernel']['machine'],
       # Published artifacts are not built for every exact platform_version (e.g.
       # a new Ubuntu/RHEL point release); fall back to the closest older
@@ -125,7 +126,7 @@ action_class do
     result = Mixlib::Install.new(options).artifact_info
 
     return result unless result.is_a?(Array)
-    raise "No matching artifact for #{node['platform']}/#{node['platform_version']}" if result.empty?
+    raise "No matching artifact for #{mixlib_platform}/#{mixlib_platform_version}" if result.empty?
 
     result.first
   end

@@ -129,6 +129,46 @@ module ChefClientUpdaterEnterprise
       parts[2]
     end
 
+    # Maps Ohai's raw platform/platform_version to the Chef downloads API's platform
+    # vocabulary, mirroring mixlib-install's own install.sh platform_detection.sh
+    # server-side remapping. This is NOT what Ohai reports: RHEL-family distros
+    # other than Rocky/Amazon report as generic 'el' with only the major version;
+    # Rocky Linux keeps its own 'rocky' platform name; Amazon Linux 2022/2023 keep
+    # 'amazon', older Amazon Linux maps to 'el' 6/7; SUSE Enterprise reports as
+    # 'sles'; openSUSE Leap keeps its own name. debian/sles/opensuseleap use major
+    # version only, never Ohai's full dotted platform_version.
+    def mixlib_install_platform_info
+      platform = node['platform'].to_s
+      platform_version = node['platform_version'].to_s
+      major_version = platform_version.split('.').first
+
+      case platform
+      when 'rocky'
+        [platform, major_version]
+      when 'amazon'
+        case platform_version
+        when '2022', '2023'
+          [platform, platform_version]
+        when '2'
+          ['el', '7']
+        else
+          ['el', '6']
+        end
+      when 'xenserver'
+        [platform, major_version]
+      else
+        if platform_family?('rhel', 'fedora')
+          ['el', major_version]
+        elsif platform_family?('suse') && platform != 'opensuseleap'
+          ['sles', major_version]
+        elsif %w(debian sles opensuseleap).include?(platform)
+          [platform, major_version]
+        else
+          [platform, platform_version]
+        end
+      end
+    end
+
     # Returns the currently installed native package version, or nil if not installed.
     # Uses platform-appropriate package query tools.
     def current_native_version(pkg_name)
