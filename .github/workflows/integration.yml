@@ -12,6 +12,7 @@ concurrency:
 env:
   HAB_LICENSE: accept-no-persist
   CHEF_LICENSE: accept-no-persist
+  CHEF_LICENSE_KEY: ${{ vars.CHEF_LICENSE_KEY }}
 
 jobs:
   integration:
