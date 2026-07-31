@@ -16,3 +16,4 @@ cookbook 'chef_client_updater_enterprise_test', path: 'test/cookbooks/chef_clien
 named_run_list :preserve_omnibus, 'recipe[chef_client_updater_enterprise_test::preserve_omnibus]'
 named_run_list :remove_omnibus,   'recipe[chef_client_updater_enterprise_test::remove_omnibus]'
 named_run_list :multi_version,    'recipe[chef_client_updater_enterprise_test::multi_version]'
+named_run_list :scheduler_fix,    'recipe[chef_client_updater_enterprise_test::scheduler_fix]'

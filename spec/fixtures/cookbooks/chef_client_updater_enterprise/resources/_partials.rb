@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 #
 # Cookbook:: chef_client_updater_enterprise
-# Resource:: Partial:: _pkg_names
+# Resource:: Partial:: _partials
 #
 # Copyright:: 2026, Corey Hemminger
 #
@@ -21,10 +21,6 @@ property :habitat_package, String,
          description: 'Habitat package identifier.',
          default: 'chef/chef-infra-client'
 
-property :product_name, String,
-         description: 'Mixlib-install product name and native OS package name.',
-         default: 'chef-ice'
-
-property :legacy_omnibus_package, String,
-         description: 'Legacy omnibus package name to purge.',
-         default: 'chef'
+property :version, String,
+         description: "Version to install. 'latest' resolves to latest stable.",
+         default: 'latest'

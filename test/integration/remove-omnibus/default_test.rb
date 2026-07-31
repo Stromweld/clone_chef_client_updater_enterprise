@@ -24,10 +24,20 @@ if os.linux?
   describe file('/opt/chef') do
     it { should_not exist }
   end
+
+  describe package('chef') do
+    it { should_not be_installed }
+  end
 end
 
 if os.windows?
   describe file('C:/opscode/chef') do
     it { should_not exist }
+  end
+
+  # Matches the display name Get-Package sees in Programs and Features, not
+  # legacy_omnibus_package ('chef') — see resources/remove_omnibus.rb.
+  describe package('Chef Infra Client*') do
+    it { should_not be_installed }
   end
 end

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 #
 # Cookbook:: chef_client_updater_enterprise
-# Resource:: Partial:: _license
+# Resource:: Partial:: _partials
 #
 # Copyright:: 2026, Corey Hemminger
 #
@@ -17,8 +17,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-property :license_key, String,
-         required: true,
-         sensitive: true,
-         description: 'Chef license key (CHEF_LICENSE_KEY). Required for chef-ice downloads.',
-         default: lazy { ENV.fetch('CHEF_LICENSE_KEY', nil) }
+property :habitat_package, String,
+         description: 'Habitat package identifier.',
+         default: 'chef/chef-infra-client'
+
+property :version, String,
+         description: "Version to install. 'latest' resolves to latest stable.",
+         default: 'latest'

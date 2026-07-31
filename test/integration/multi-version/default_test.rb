@@ -8,6 +8,7 @@
 title 'multi-version upgrade verification'
 
 expected_version = input('expected_chef_ice_version', value: '19.3.15')
+older_version = input('older_chef_ice_version', value: '19.2.12')
 
 describe command('chef-client --version') do
   its('exit_status') { should eq 0 }
@@ -28,10 +29,16 @@ if os.linux?
     it { should be_directory }
   end
 
-  # After cleanup keep_versions 1, only 19.3.15 should remain
+  # After cleanup keep_versions 1, only 19.3.15 should remain — assert both
+  # that the new version is present AND the older one was actually pruned.
   describe command('ls /hab/pkgs/chef/chef-infra-client') do
     its('exit_status') { should eq 0 }
     its('stdout') { should include(expected_version) }
+    its('stdout') { should_not include(older_version) }
+  end
+
+  describe file("/hab/pkgs/chef/chef-infra-client/#{older_version}") do
+    it { should_not exist }
   end
 end
 

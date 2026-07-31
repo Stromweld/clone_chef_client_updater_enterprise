@@ -3,7 +3,7 @@ driver:
   name: ec2
   region: us-west-2
   subnet_id: subnet-044d7de3548d5a434
-  security_group_ids: sg-0a3cefebf4dfe4fda
+  security_group_ids: sg-071f219c0b0c4d093
   instance_type: t3a.large
   retryable_tries: 120
   associate_public_ip: true
@@ -24,6 +24,16 @@ platforms:
     driver:
       tags:
         Name: <%= ENV['USER'] %>-tk-rhel-9
+
+  - name: opensuse-leap-15
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-opensuse-leap-15
+
+  - name: opensuse-leap-16
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-opensuse-leap-16
 
   - name: ubuntu-24.04
     driver:

@@ -11,6 +11,7 @@ Chef Infra Client >= 17.0 (required for the `use` partial DSL).
 - RHEL 7, 8, 9 (CentOS, AlmaLinux, Red Hat Enterprise Linux)
 - Ubuntu 18.04, 22.04, 24.04
 - SLES 15 SP5, SP6 (openSUSE Leap 15)
+- Windows Server 2022
 
 ### Dependencies
 
@@ -31,7 +32,7 @@ Set the `CHEF_LICENSE_KEY` environment variable on your nodes, then use the inst
 chef_client_updater_enterprise_install 'default'
 ```
 
-This downloads the latest stable `chef-ice` package, installs it via the native package manager, and creates Habitat binlinks. To also clean up old versions and remove a legacy omnibus installation:
+This downloads the latest stable `chef-ice` package, installs it via the native package manager (rpm/deb/msi, preserving any previously installed `chef-ice` version and the legacy omnibus install), creates Habitat binlinks, and re-execs the running `chef-client` process under the new binary. To also clean up old versions and remove a legacy omnibus installation:
 
 ```ruby
 chef_client_updater_enterprise_install 'default'
@@ -43,9 +44,11 @@ end
 chef_client_updater_enterprise_remove_omnibus 'default'
 ```
 
+See [documentation/resources/install.md](documentation/resources/install.md) for details on the multi-version preservation and scheduler reconvergence mechanisms.
+
 ## Testing
 
-This cookbook uses Test Kitchen with both Vagrant and Dokken drivers:
+This cookbook uses Test Kitchen with Vagrant, Dokken, and live EC2 drivers:
 
 ```bash
 # Vagrant (kitchen.yml)
@@ -53,6 +56,10 @@ kitchen converge
 
 # Dokken (kitchen.dokken.yml)
 KITCHEN_LOCAL_YAML=kitchen.dokken.yml kitchen converge
+
+# Live EC2 (kitchen.ec2.yml) — required for platforms without a Vagrant/Dokken box,
+# e.g. windows-2022 and rhel-9. Requires AWS credentials and a Chef license key.
+KITCHEN_LOCAL_YAML=kitchen.ec2.yml CHEF_LICENSE_KEY=<your-license-key> kitchen converge
 ```
 
 ## License

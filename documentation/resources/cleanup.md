@@ -3,7 +3,9 @@
 
 [back to resource list](../../README.md#resources)
 
-Prunes old Habitat package versions of Chef Infra Client, keeping only the most recent installations. Uses `hab pkg list` to enumerate installed versions and `hab pkg uninstall` to remove the oldest entries beyond the retention count.
+Prunes old Habitat package versions of Chef Infra Client, keeping only the most recent installations. Enumerates installed versions via a filesystem glob under the Habitat package root (no `hab` CLI dependency for listing) and removes the oldest entries beyond the retention count via Chef's built-in `habitat_package` resource with `action :remove`.
+
+The Habitat ident backing the *currently running* `chef-client` process is always excluded from removal, even if it would otherwise fall outside the retained count — removing it out from under the running process would break the converge.
 
 Introduced: v0.1.0
 

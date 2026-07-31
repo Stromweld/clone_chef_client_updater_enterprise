@@ -4,6 +4,8 @@ driver:
 
 provisioner:
   name: chef_infra
+  product_name: chef
+  product_version: 18
   chef_license: accept-no-persist
   retry_on_exit_code:
     - 213
@@ -18,29 +20,32 @@ verifier:
 
 platforms:
   - name: almalinux-9
-    driver:
-      box: bento/almalinux-9
-      box_version: 202511.24.0
+  - name: almalinux-10
+  - name: opensuse-leap-15
+  - name: opensuse-leap-16
   - name: ubuntu-2404
-    driver:
-      box: bento/ubuntu-24.04
+  - name: ubuntu-2604
   - name: windows-2022
     driver:
       box: stromweld/windows-2022
       customize:
         memory: 4096
-    transport:
-      name: winrm
-    provisioner:
-      product_name: chef
-      product_version: 18
+  - name: windows-11
+    driver:
+      box: stromweld/windows-11
+      customize:
+        memory: 4096
 
 suites:
+  - name: default
+    verifier:
+      inspec_tests:
+        - test/integration/default
+      inputs:
+        expected_chef_ice_version: '19.3.15'
   - name: preserve-omnibus
     provisioner:
       named_run_list: preserve_omnibus
-      product_name: chef
-      product_version: 18
     verifier:
       inspec_tests:
         - test/integration/preserve-omnibus
@@ -50,9 +55,21 @@ suites:
   - name: remove-omnibus
     provisioner:
       named_run_list: remove_omnibus
-      multiple_converge: 2
-      product_name: chef
-      product_version: 18
+    # remove_omnibus defers deletion while still running under the legacy omnibus
+    # chef-client (see resources/remove_omnibus.rb); this hook performs the
+    # genuinely separate second chef-client run needed to complete the removal,
+    # invoking the cookbook's own stable binlink directly so it never resolves
+    # back to the omnibus binary. See AGENTS.md "Omnibus Removal" for the full
+    # rationale.
+    lifecycle:
+      post_converge:
+        - remote: export TEST_KITCHEN=1; export IS_KITCHEN=true; sudo -E /usr/bin/chef-client --local-mode --config /tmp/kitchen/client.rb --json-attributes /tmp/kitchen/dna.json --no-color
+          excludes:
+            - windows-2022
+        - remote: |
+            C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json --no-color
+          includes:
+            - windows-2022
     verifier:
       inspec_tests:
         - test/integration/remove-omnibus
@@ -62,11 +79,19 @@ suites:
   - name: multi-version
     provisioner:
       named_run_list: multi_version
-      product_name: chef-ice
-      product_version: 19.2.12
+
     verifier:
       inspec_tests:
         - test/integration/multi-version
       inputs:
         expected_chef_ice_version: '19.3.15'
         older_chef_ice_version: '19.2.12'
+
+  - name: scheduler-fix
+    provisioner:
+      named_run_list: scheduler_fix
+    verifier:
+      inspec_tests:
+        - test/integration/scheduler-fix
+      inputs:
+        expected_chef_ice_version: '19.3.15'

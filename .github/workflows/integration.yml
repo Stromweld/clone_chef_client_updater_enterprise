@@ -23,6 +23,10 @@ jobs:
           - ubuntu-2604
         suite:
           - default
+          - preserve-omnibus
+          - multi-version
+          - scheduler-fix
+          - remove-omnibus
       fail-fast: false
 
     steps:
@@ -30,6 +34,20 @@ jobs:
         uses: actions/checkout@v7
       - name: Install Chef
         uses: actionshub/chef-install@main
-      - name: Kitchen Test
+      - name: Kitchen Converge
+        run: |
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Kitchen Converge again (idempotency check)
+        # multi-version deliberately installs/prunes a different Habitat version on
+        # every converge (see test/cookbooks/.../recipes/multi_version.rb) — it will
+        # never be idempotent by design, so skip the check for that suite only.
+        if: matrix.suite != 'multi-version'
+        run: |
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | tee /tmp/second-converge.log
+          if grep -qE '[1-9][0-9]*/[0-9]+ resources updated' /tmp/second-converge.log; then
+            echo "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} reported resource changes — cookbook is not idempotent"
+            exit 1
+          fi
+      - name: Kitchen Verify
         run: |
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
