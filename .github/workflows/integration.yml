@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  HABITAT_LICENSE: accept-no-persist
+  HAB_LICENSE: accept-no-persist
 
 jobs:
   integration:
