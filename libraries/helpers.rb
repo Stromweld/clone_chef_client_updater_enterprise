@@ -138,8 +138,8 @@ module ChefClientUpdaterEnterprise
     # 'sles'; openSUSE Leap keeps its own name. debian/sles/opensuseleap use major
     # version only, never Ohai's full dotted platform_version.
     def mixlib_install_platform_info
-      platform = node['platform'].to_s
-      platform_version = node['platform_version'].to_s
+      platform = node['platform']
+      platform_version = node['platform_version']
       major_version = platform_version.split('.').first
 
       case platform
@@ -150,9 +150,9 @@ module ChefClientUpdaterEnterprise
         when '2022', '2023'
           [platform, platform_version]
         when '2'
-          ['el', '7']
+          %w(el 7)
         else
-          ['el', '6']
+          %w(el 6)
         end
       when 'xenserver'
         [platform, major_version]
