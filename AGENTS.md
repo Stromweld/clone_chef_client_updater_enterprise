@@ -284,14 +284,18 @@ early version of the ad-hoc verification harness used for this check had its own
 `NOT_IDEMPOTENT`. Fixed by anchoring the regex to `Infra Phase complete, [1-9][0-9]*/[0-9]+ resources
 updated`. Not a cookbook bug — a lesson for anyone else scripting Kitchen-log-based idempotency
 checks against this cookbook's `Infra Phase complete, X/Y resources updated` output format.
-`preserve-omnibus-rhel-9` could not be verified end-to-end in this pass: three consecutive live EC2
-attempts all failed identically, but at the `chef_infra` provisioner's own initial omnibus Chef v18
-bootstrap step (`kitchen.yml`'s `product_version: 18`) — before any of this cookbook's resources run
-at all — with a transient `Omnitruck artifact does not exist for version 18 on platform el` 404 from
-`chefdownload-commercial.chef.io`, despite the identical metadata URL succeeding reliably via direct
-`curl` from the orchestrating machine at the same time. This points to EC2-instance-side
-DNS/network flakiness reaching that endpoint during provisioning, not a cookbook or omnitruck-service
-bug — retry if this recurs.
+`preserve-omnibus-rhel-9` initially failed three consecutive times at the `chef_infra` provisioner's
+own initial omnibus Chef v18 bootstrap step (`kitchen.yml`'s `product_version: 18`) — before any of
+this cookbook's resources run at all — with a transient `Omnitruck artifact does not exist for
+version 18 on platform el` 404 from `chefdownload-commercial.chef.io`, despite the identical metadata
+URL succeeding reliably via direct `curl` from the orchestrating machine at the same time. On a
+fourth attempt (fresh AWS session), bootstrap succeeded cleanly and the full converge+reconverge+
+verify cycle passed: converge 1 installed chef-ice 19.3.15 (6/11 resources updated), converge 2
+reported `0/11 resources updated` (fully idempotent, `migrate-ice apply airgap` skipped via
+`not_if`), and `kitchen verify` passed all 9 InSpec checks (chef-client 19.3.15 correctly binlinked
+at `/usr/bin/chef-client`, `/opt/chef` legacy omnibus preserved). This confirms the three earlier
+404s were transient EC2-instance-side DNS/network flakiness reaching that endpoint during
+provisioning, not a cookbook or omnitruck-service bug — retry if this recurs.
 
 ## Scheduler Resource Reconvergence (in-place, no process handoff, all platforms)
 
