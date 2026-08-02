@@ -3,6 +3,7 @@ driver:
   name: dokken
   privileged: true
   chef_image: chef/chef
+  platform: linux/amd64 # TEMP-LOCAL-TESTING-ONLY: force x86_64 on arm64 host; revert before commit
 
 transport:
   name: dokken
@@ -10,6 +11,7 @@ transport:
 provisioner:
   name: dokken
   chef_license: accept-no-persist
+  clean_dokken_sandbox: false
 
 verifier:
   name: inspec
@@ -53,7 +55,7 @@ platforms:
       pid_one_command: /usr/lib/systemd/systemd
   - name: opensuse-leap-16
     driver:
-      image: dokken/opensuse-leap-16
+      image: dokken/opensuse-leap-16.0
       pid_one_command: /usr/lib/systemd/systemd
   - name: oraclelinux-8
     driver:
@@ -94,6 +96,6 @@ platforms:
   - name: ubuntu-26.04
     driver:
       image: dokken/ubuntu-26.04
-      pid_one_command: /bin/systemd
+      pid_one_command: /usr/lib/systemd/systemd
       intermediate_instructions:
         - RUN /usr/bin/apt-get update -y

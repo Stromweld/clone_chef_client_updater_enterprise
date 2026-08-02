@@ -8,12 +8,13 @@ require_relative '../../../libraries/helpers'
 class HelpersTestHost
   include ChefClientUpdaterEnterprise::Helpers
 
-  attr_accessor :fake_windows, :fake_platform, :fake_platform_family
+  attr_accessor :fake_windows, :fake_platform, :fake_platform_family, :fake_node
 
   def initialize
     @fake_windows = false
     @fake_platform = nil
     @fake_platform_family = []
+    @fake_node = {}
   end
 
   def windows?
@@ -27,10 +28,83 @@ class HelpersTestHost
   def platform_family?(*families)
     (families & @fake_platform_family).any?
   end
+
+  def node
+    @fake_node
+  end
 end
 
 describe ChefClientUpdaterEnterprise::Helpers do
   subject(:host) { HelpersTestHost.new }
+
+  describe '#mixlib_install_platform_info' do
+    def set_platform(host, platform:, platform_version:, platform_family: [])
+      host.fake_node = { 'platform' => platform, 'platform_version' => platform_version }
+      host.fake_platform = platform
+      host.fake_platform_family = platform_family
+    end
+
+    it 'maps redhat to el + major version' do
+      set_platform(host, platform: 'redhat', platform_version: '9.4', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(el 9))
+    end
+
+    it 'maps centos to el + major version' do
+      set_platform(host, platform: 'centos', platform_version: '7.9', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(el 7))
+    end
+
+    it 'maps almalinux to el + major version' do
+      set_platform(host, platform: 'almalinux', platform_version: '9.8', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(el 9))
+    end
+
+    it 'maps oracle to el + major version' do
+      set_platform(host, platform: 'oracle', platform_version: '9.8', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(el 9))
+    end
+
+    it 'keeps rocky as its own platform key + major version (not folded into el)' do
+      set_platform(host, platform: 'rocky', platform_version: '9.5', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(rocky 9))
+    end
+
+    it 'keeps fedora as its own platform key + major version (not folded into el) — ' \
+       'omnitruck-service recognizes "fedora" as a distinct, valid platform key' do
+      set_platform(host, platform: 'fedora', platform_version: '44', platform_family: %w(rhel fedora))
+      expect(host.mixlib_install_platform_info).to eq(%w(fedora 44))
+    end
+
+    it 'keeps amazon linux 2022/2023 as amazon + the full platform_version string' do
+      set_platform(host, platform: 'amazon', platform_version: '2023', platform_family: %w(rhel fedora amazon))
+      expect(host.mixlib_install_platform_info).to eq(%w(amazon 2023))
+    end
+
+    it 'maps amazon linux 2 to el/7' do
+      set_platform(host, platform: 'amazon', platform_version: '2', platform_family: %w(rhel fedora amazon))
+      expect(host.mixlib_install_platform_info).to eq(%w(el 7))
+    end
+
+    it 'maps generic SUSE (not opensuseleap) to sles + major version' do
+      set_platform(host, platform: 'suse', platform_version: '15.5', platform_family: %w(suse))
+      expect(host.mixlib_install_platform_info).to eq(%w(sles 15))
+    end
+
+    it 'keeps opensuseleap as its own platform key + major version' do
+      set_platform(host, platform: 'opensuseleap', platform_version: '15.5', platform_family: %w(suse))
+      expect(host.mixlib_install_platform_info).to eq(%w(opensuseleap 15))
+    end
+
+    it 'keeps debian as its own platform key + major version' do
+      set_platform(host, platform: 'debian', platform_version: '12.7', platform_family: %w(debian))
+      expect(host.mixlib_install_platform_info).to eq(%w(debian 12))
+    end
+
+    it 'passes ubuntu through with the full platform_version string' do
+      set_platform(host, platform: 'ubuntu', platform_version: '24.04', platform_family: %w(debian))
+      expect(host.mixlib_install_platform_info).to eq(%w(ubuntu 24.04))
+    end
+  end
 
   describe '#hab_pkg_root' do
     it 'returns the Windows path when windows?' do
@@ -64,6 +138,61 @@ describe ChefClientUpdaterEnterprise::Helpers do
     it 'uses /usr/bin on Linux' do
       expect(host.chef_client_binlink_dir).to eq('/usr/bin')
       expect(host.chef_client_binlink_path).to eq('/usr/bin/chef-client')
+    end
+  end
+
+  describe '#chef_client_hab_binary_path' do
+    it 'returns nil when no version of the package is installed' do
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return([])
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to be_nil
+    end
+
+    it 'resolves to the newest installed version/release directory\'s bin/chef-client on Linux' do
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000',
+         '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client'
+      )
+    end
+
+    it 'resolves to a .bat filename on Windows' do
+      host.fake_windows = true
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client.bat'
+      )
+    end
+
+    it 'resolves to the pinned older version\'s directory when multiple versions are installed ' \
+       'and an explicit version is given, even though a newer one exists on disk' do
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000',
+         '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client', '19.2.12')).to eq(
+        '/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000/bin/chef-client'
+      )
+    end
+
+    it 'falls back to the newest installed version when version is \'latest\'' do
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000',
+         '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client', 'latest')).to eq(
+        '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client'
+      )
+    end
+
+    it 'returns nil when the pinned version is not installed' do
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client', '19.2.12')).to be_nil
     end
   end
 

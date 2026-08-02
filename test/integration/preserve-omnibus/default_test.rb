@@ -23,9 +23,9 @@ if os.linux?
     its('link_path') { should include(expected_version) }
   end
 
-  # Kitchen writes client.rb to /etc/chef during bootstrap — this is what "preserve" means for a running node
-  describe file('/etc/chef') do
+  describe file('/opt/chef') do
     it { should exist }
+    it { should be_directory }
   end
 end
 

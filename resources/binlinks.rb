@@ -156,6 +156,27 @@ action :create do
 
     windows_path 'C:\hab\bin' do
       action :add
+      # `windows_path`'s own `:add` action provider always reports itself
+      # "updated" even when its inner `env "path" { action :modify }`
+      # sub-resource makes no change (confirmed live: the log shows
+      # `windows_env[path] action modify (up to date)` nested directly under
+      # `windows_path[C:\hab\bin] action add`, yet the outer resource still
+      # counts as updated) -- Chef core's `WindowsPath#action :add` has no
+      # idempotency guard of its own and never propagates
+      # `updated_by_last_action(false)` from the sub-resource it declares.
+      # This permanently breaks converge idempotency on every Windows run.
+      # Guard it ourselves by checking the live PATH env var directly.
+      not_if do
+        current_path = begin
+          require 'win32/registry' if windows?
+          ::Win32::Registry::HKEY_LOCAL_MACHINE.open(
+            'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          ) { |reg| reg['path'] }
+                       rescue StandardError
+                         ENV['PATH'].to_s
+        end
+        current_path.split(::File::PATH_SEPARATOR).any? { |p| p.casecmp('C:\hab\bin').zero? }
+      end
     end
   end
 end

@@ -24,23 +24,34 @@ platforms:
     driver:
       tags:
         Name: <%= ENV['USER'] %>-tk-rhel-9
-
-  - name: opensuse-leap-15
+  - name: rhel-10
     driver:
       tags:
-        Name: <%= ENV['USER'] %>-tk-opensuse-leap-15
-
+        Name: <%= ENV['USER'] %>-tk-rhel-10
   - name: opensuse-leap-16
     driver:
+      image_id: ami-01e8f34bf515f1207
       tags:
         Name: <%= ENV['USER'] %>-tk-opensuse-leap-16
-
+    transport:
+      username: ec2-user
   - name: ubuntu-24.04
     driver:
       tags:
         Name: <%= ENV['USER'] %>-tk-ubuntu-24.04
-
+  - name: ubuntu-26.04
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-ubuntu-26.04
+  - name: windows-11
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-windows-11
   - name: windows-2022
     driver:
       tags:
         Name: <%= ENV['USER'] %>-tk-windows-2022
+  - name: windows-2025
+    driver:
+      tags:
+        Name: <%= ENV['USER'] %>-tk-windows-2025

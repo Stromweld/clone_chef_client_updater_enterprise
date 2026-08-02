@@ -82,18 +82,32 @@ module ChefClientUpdaterEnterprise
     end
 
     # Returns the full stable path to the chef-client binlink: a real symlink on
-    # Linux/macOS, a generated `.bat` shim on Windows. This is the path scheduler
-    # resources (chef_client_cron, chef_client_launchd, chef_client_systemd_timer,
-    # chef_client_scheduled_task) should be pointed at via `chef_binary_path` instead
-    # of the core resources' own lazy default (`Chef::ResourceHelpers::PathHelpers
-    # .chef_client_hab_binary_path`), which File.realpath's back to a fully-versioned
-    # Habitat path that chef_client_updater_enterprise_cleanup can later delete.
+    # Linux/macOS, a generated `.bat` shim on Windows. This is a convenience path
+    # exposed for other resources (chef_client_updater_enterprise_binlinks' `--dest`,
+    # end-user recipes/InSpec checks that just want "the current chef-client"), but is
+    # NOT what scheduler resources should be pointed at via `chef_binary_path` — see
+    # chef_client_hab_binary_path below for why.
     def chef_client_binlink_path
       if windows?
         "#{chef_client_binlink_dir}\\chef-client.bat"
       else
         "#{chef_client_binlink_dir}/chef-client"
       end
+    end
+
+    # Returns the full path to the chef-client binary inside a Habitat package.
+    def chef_client_hab_binary_path(pkg, version = nil)
+      dirs = hab_pkg_dirs(pkg)
+      target_dir =
+        if version && version != 'latest'
+          dirs.select { |d| d.split('/')[-2] == version }.last
+        else
+          dirs.last
+        end
+      return unless target_dir
+
+      bin_name = windows? ? 'chef-client.bat' : 'chef-client'
+      ::File.join(target_dir, 'bin', bin_name)
     end
 
     # Returns a sorted array of VERSION/RELEASE subdirectory paths under hab_pkg_root(pkg).
@@ -157,11 +171,11 @@ module ChefClientUpdaterEnterprise
       when 'xenserver'
         [platform, major_version]
       else
-        if platform_family?('rhel', 'fedora')
+        if %w(redhat centos almalinux oracle).include?(platform)
           ['el', major_version]
         elsif platform_family?('suse') && platform != 'opensuseleap'
           ['sles', major_version]
-        elsif %w(debian sles opensuseleap).include?(platform)
+        elsif %w(debian sles opensuseleap fedora).include?(platform)
           [platform, major_version]
         else
           [platform, platform_version]
@@ -256,6 +270,20 @@ module ChefClientUpdaterEnterprise
         # Fallback
         ::File.expand_path('../..', RbConfig::CONFIG['bindir'])
       end
+    end
+
+    # Returns true if `chef-client` resolves via $PATH (a plain `which`/`where` check, not
+    # anything to do with the CURRENTLY RUNNING process — see running_under_omnibus? for that).
+    # migrate-ice's own `--fresh-install` vs. non-fresh-install branching logic (confirmed live
+    # via /var/log/chef19migrate.log and direct binary testing on EC2) determines "is chef-client
+    # already installed?" by shelling out to `chef-client` via $PATH, NOT by checking for /opt/chef
+    # on disk. This helper mirrors that exact check so `chef_client_updater_enterprise_install` can
+    # decide which of migrate-ice's two paths to invoke. See the `--fresh-install` decision at the
+    # `execute 'migrate-ice apply airgap'` resource for why this distinction matters.
+    def chef_client_on_path?
+      exe = windows? ? 'chef-client.bat' : 'chef-client'
+      path_dirs = ENV['PATH'].to_s.split(::File::PATH_SEPARATOR)
+      path_dirs.any? { |dir| ::File.executable?(::File.join(dir, exe)) }
     end
 
     # Returns true if the currently executing Chef process is running from a legacy omnibus install.
