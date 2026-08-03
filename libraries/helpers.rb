@@ -286,6 +286,20 @@ module ChefClientUpdaterEnterprise
       path_dirs.any? { |dir| ::File.executable?(::File.join(dir, exe)) }
     end
 
+    # Returns true if `path` is itself a filesystem mount point (e.g. a dedicated
+    # block device mounted at /opt/chef, which some users use to keep the
+    # omnibus install isolated from the root drive image). Compares the device
+    # ID of `path` against its parent directory's device ID - they differ only
+    # when `path` is where a separate filesystem is mounted. Deleting such a
+    # directory outright always raises Errno::EBUSY ("Device or resource
+    # busy"), even when empty, so callers must empty its contents instead of
+    # removing the directory itself. Not meaningful on Windows.
+    def mount_point?(path)
+      return false unless ::File.directory?(path)
+
+      ::File.stat(path).dev != ::File.stat(::File.dirname(path)).dev
+    end
+
     # Returns true if the currently executing Chef process is running from a legacy omnibus install.
     def running_under_omnibus?
       root = running_chef_root

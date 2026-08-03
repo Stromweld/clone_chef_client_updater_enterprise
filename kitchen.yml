@@ -59,7 +59,8 @@ suites:
     # rationale.
     lifecycle:
       post_converge:
-        - remote: export TEST_KITCHEN=1; export IS_KITCHEN=true; sudo -E /usr/bin/chef-client --local-mode --config /tmp/kitchen/client.rb --json-attributes /tmp/kitchen/dna.json --no-color
+        - remote: |
+            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; sudo -E /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json" --no-color'
           excludes:
             - windows-2022
         - remote: |

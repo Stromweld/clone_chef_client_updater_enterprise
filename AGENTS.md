@@ -127,6 +127,21 @@ When `remove_directories` is true, it also deletes:
 - Windows: `C:\opscode\chef`
 - macOS: runs `pkgutil --forget com.chef.chef` only if that receipt is currently registered
 
+**`/opt/chef` may itself be a dedicated mount point — never `rmdir` it, only empty its contents.**
+Some customers deliberately mount a separate block device at `/opt/chef` to keep the omnibus
+install isolated from the root drive image (confirmed reproducible: the official `chef/chef`
+Dokken/Docker test image itself declares `/opt/chef` as a Docker `VOLUME`). `directory <path> action
+:delete` on such a path is really an `rmdir()` on the mountpoint, which the kernel unconditionally
+refuses with `Errno::EBUSY` ("Device or resource busy") regardless of whether the directory is
+empty first — this is not something retries or `only_if` guards can work around. The
+`mount_point?(path)` helper in `libraries/helpers.rb` detects this (comparing `File.stat(path).dev`
+against its parent directory's device ID) and, when true, the resource iterates
+`Dir.children(omnibus_dir)` and deletes each entry individually with `file`/`directory` (chosen per
+entry via `File.directory?`, since e.g. `/opt/chef/LICENSE` is a plain file, not a directory) instead
+of ever calling `directory action :delete` on the mount point itself. When `/opt/chef` is a plain,
+non-mounted directory (the common case), the original single `directory action :delete` path is
+used unchanged.
+
 **Windows package uninstall discovers the display name first, then uses `windows_package`.**
 `Chef::Provider::Package::Windows::RegistryUninstallEntry.find_entries` (Chef core) matches the
 Programs-and-Features *display* name via **exact string equality**, not the `legacy_omnibus_package`
@@ -158,6 +173,36 @@ this either — it chains N chef-client invocations against a single executable 
 not per invocation, so it can never pick up chef-ice mid-chain. Do not remove this hook or attempt
 to make `remove_omnibus` complete in a single converge; that would require changing its guard logic,
 which is deliberately out of scope (see the resource description above).
+
+**The `remove-omnibus` `post_converge` hook must be wrapped in `sh -c '...'` under Dokken.**
+`kitchen-dokken`'s transport execs commands as a raw argv array (`Shellwords.shellwords(command)`,
+no shell involved) rather than through `/bin/sh`, so a bare `export FOO=1; export BAR=2; sudo ...`
+fails immediately with `exec: "export": executable file not found in $PATH` — `export` is a shell
+builtin, not a real binary on `$PATH`, and `;`-separated commands have no meaning without a shell to
+interpret them. The ssh-based transport used by `kitchen.yml`'s Vagrant suites already runs remote
+commands through a shell, so wrapping in `sh -c '...'` is a no-op there but required for Dokken. The
+hook also can't hardcode a single sandbox root path: the ssh/`chef_infra` provisioner (Vagrant)
+extracts to `/tmp/kitchen`, while the `dokken` provisioner extracts to `/opt/kitchen` — since this
+one `kitchen.yml` is shared by both drivers (`kitchen.dokken.yml` only overrides `driver`/
+`transport`/`provisioner` name, not `suites`), the hook probes for `/opt/kitchen/client.rb` and
+falls back to `/tmp/kitchen` otherwise, rather than assuming either path.
+
+**`remove-omnibus` must be excluded from the CI idempotency check's *second top-level* `kitchen
+converge`** (`.github/workflows/integration.yml`), for a structural reason distinct from
+`multi-version`'s (which is excluded because it deliberately installs a different version every
+run). `kitchen-dokken`'s provisioner hardcodes `default_config :chef_binary,
+"/opt/chef/bin/chef-client"` for literally every top-level `kitchen converge` invocation — that's
+how the *first* converge legitimately bootstraps against the base Docker image's pre-baked omnibus
+chef-client. But this suite's entire purpose is to delete `/opt/chef` by the end of that first
+converge, so a second top-level `kitchen converge` has no omnibus binary left to bootstrap from and
+fails immediately with `Errno::ENOENT: /opt/chef/bin/chef-client`. This is NOT a regression or a
+missed idempotency check: the suite's own `post_converge` lifecycle hook above already performs the
+genuinely separate second chef-client run (via the stable chef-ice binlink, not the now-deleted
+omnibus binary) on every single `kitchen converge`, so the underlying resources' idempotency is
+still exercised — confirmed by manually re-invoking the hook's exact command a second time and
+observing `0/16 resources updated`. Do not remove this CI exclusion or try to make a second
+top-level `kitchen converge` work for this suite; the fix would require reconfiguring
+`kitchen-dokken`'s hardcoded `chef_binary` per-invocation, which the gem does not support.
 
 ## Platform Support
 
@@ -273,6 +318,20 @@ Do not go back to unconditionally passing `--fresh-install`, and do not gate the
 `File.directory?('/opt/chef')` either (that reintroduces the older, now-removed mount-remount
 failure mode this comment used to warn about) — `chef_client_on_path?` is the one check that matches
 migrate-ice's own internal logic exactly.
+
+**`execute[migrate-ice apply airgap]` carries `retries 3` / `retry_delay 5`** to work around an
+upstream migrate-ice/Go-runtime bug, not a cookbook logic issue. Under CPU-constrained/virtualized/
+emulated environments (confirmed 100% reproducible in a local Dokken container running under qemu
+emulation on Apple Silicon; observed intermittently on real GitHub-hosted Actions runners too),
+migrate-ice can crash with a Go garbage-collector background-worker race — `fatal error:
+lfstack.push ... created by runtime.gcBgMarkStartWorkers`, exit code 2 — while extracting the
+~160MB airgap tarball. This happens regardless of the `--fresh-install`/`--preserve-omnibus` flag
+values (tested both combinations) and regardless of `GOMAXPROCS` (tested `GOMAXPROCS=1`, still
+crashed) — it is inherent to the flag itself under resource contention. The exact same command with
+the exact same flags and no other state change reliably succeeds on retry, so `retries`/
+`retry_delay` is the correct fix; do not attempt to "fix" this by altering the fresh-install/
+preserve-omnibus flag logic (already correct, see above) or by disabling GC tuning.
+
 
 **End-to-end verification (live EC2, full Kitchen converge+reconverge cycle):** Confirmed on
 `preserve-omnibus-ubuntu-2404` — first converge installed chef-ice and correctly populated

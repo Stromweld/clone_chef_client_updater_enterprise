@@ -551,6 +551,8 @@ action :install do
     sensitive true
     only_if { ::File.exist?('/hab/migration/bin/migrate-ice') }
     only_if { ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').any? }
+    retries 3
+    retry_delay 5
     # `execute` has no built-in idempotency of its own — without this guard it
     # unconditionally re-runs migrate-ice on every single converge, even when
     # rpm_package/dpkg already correctly reported "up to date" for the same
