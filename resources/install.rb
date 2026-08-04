@@ -195,6 +195,89 @@ action_class do
     end
     any_updated
   end
+
+  # Shared entry point called from BOTH the "already installed, nothing to do"
+  # early-out and the tail of a genuine install/upgrade, so reconvergence runs
+  # on every single converge — not only the converge that happens to perform
+  # an install/upgrade. This is the actual fix for the chef_binary_path
+  # flip-flop bug: an earlier version of this action only reached the
+  # reconvergence logic below when the package-install branch executed,
+  # returning early (skipping reconvergence entirely) on every converge where
+  # chef-ice was already at the pinned/current version. Since resolving a
+  # stable path here is what overrides the scheduler resource's own built-in
+  # default, skipping it left that default's evaluation up to whichever Chef
+  # Infra Client gem happened to be bootstrapping THAT specific converge —
+  # different platforms/CI runs bootstrap from different gem vintages (some
+  # pre-19.x with a hardcoded legacy default, others already chef-ice with a
+  # lazy hab-aware default), so which stale/inconsistent value got left in
+  # place varied by platform. That is why the flip-flop direction was
+  # inconsistent between platforms rather than a simple, single-direction
+  # regression.
+  #
+  # Deliberately called only after the package install/upgrade branch (or the
+  # already-installed short-circuit) has already run in the SAME converge:
+  # chef_client_hab_binary_path must resolve `hab_pkg_dirs`/binlink state as it
+  # exists after this converge's own install+binlink work is finalized, not
+  # whatever was on disk before this action started. Resolving it any earlier
+  # (e.g. once at the top of the action, before the package/migrate-ice/binlink
+  # resources below have actually run) risks resolving a stale, pre-binlink
+  # value on the very converge that installs/upgrades chef-ice for the first
+  # time. Calling this once, here, after all of that has completed for both
+  # code paths is what guarantees a single, canonical, stable resolution per
+  # converge.
+  def reconverge_installed_scheduler_resources(new_resource)
+    # Deliberately NOT chef_client_binlink_path (the mutable /usr/bin/chef-client symlink) — see
+    # ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path for why scheduler resources
+    # must be pointed at the resolved, immutable, fully-versioned Habitat path instead.
+    # Pass new_resource.version so a user pinning to an older, specific version (e.g. to
+    # work around a bug in the latest release) doesn't get silently overridden by a newer
+    # version that may already be present on disk from an earlier install/run.
+    resolved_binary_path = chef_client_hab_binary_path(new_resource.habitat_package, new_resource.version)
+    update_scheduler_enabled = new_resource.update_scheduler_resources
+    # run_context here is a CHILD RunContext scoped to this action's own nested resource
+    # declarations (empty of sibling recipe-level resources even in unified_mode) — only
+    # root_run_context.resource_collection reaches the full, shared, recipe-level collection.
+    resource_collection = run_context.root_run_context.resource_collection
+
+    if update_scheduler_enabled && resolved_binary_path.nil?
+      Chef::Log.warn(
+        'chef_client_updater_enterprise: update_scheduler_resources is true but no installed ' \
+        "#{new_resource.habitat_package} Habitat package was found to resolve a chef_binary_path from."
+      )
+    end
+
+    # Runs unconditionally on every converge (not gated behind a notification) specifically so it
+    # self-heals on a later no-op converge too, not just the converge that actually
+    # installs/upgrades chef-ice. The individual chef_client_cron/systemd_timer/launchd/
+    # scheduled_task resources are declared with no explicit chef_binary_path in user recipes, so
+    # their own built-in lazy default re-evaluates every single time their action is re-run — on an
+    # older bootstrap chef-client (pre-19.x) that default is a hardcoded legacy omnibus path (see
+    # comment on reconverge_scheduler_resources above), so if this only ran when notified by an
+    # actual chef-ice change, any later unrelated converge would silently flip the scheduler's
+    # binary path back to that stale default with nothing left to correct it. Running every converge
+    # instead means reconverge_scheduler_resources always re-asserts resolved_binary_path, so the
+    # scheduler resource's own idempotency (each resource's underlying template/cron_d/systemd_unit
+    # compares rendered content, not "did chef-ice change this run") is what actually determines
+    # whether anything reports a diff. resolved_binary_path only changes when a NEW chef-ice version
+    # is actually installed (chef_client_hab_binary_path always resolves the latest installed
+    # version's directory), so this can never itself cause a false "not idempotent" result on an
+    # unrelated converge.
+    #
+    # Deliberately a plain Ruby call, NOT a `ruby_block` resource: `Chef::Provider::RubyBlock#
+    # action_run` unconditionally wraps `new_resource.block.call` in `converge_by`, which marks
+    # the ruby_block resource itself "updated" on every single converge regardless of what the
+    # block's own return value or internal `updated_by_last_action` calls indicate — confirmed by
+    # reading chef-ice's own bundled chef gem's `lib/chef/provider/ruby_block.rb`. That made this
+    # step permanently report itself as a change every converge, which broke the CI idempotency
+    # check (`2/17 resources updated` on every second converge, forever) even when
+    # reconverge_scheduler_resources itself found nothing to change. Since the whole resource is
+    # `unified_mode true`, calling this directly as plain Ruby inside the action body runs at
+    # exactly the same point in convergence a `ruby_block` would have, without a wrapper resource
+    # that can misreport its own idempotency.
+    return unless update_scheduler_enabled && resolved_binary_path && ::File.exist?(resolved_binary_path)
+
+    reconverge_scheduler_resources(resource_collection, resolved_binary_path)
+  end
 end
 
 action :install do
@@ -202,6 +285,25 @@ action :install do
     installed = current_installed_version(new_resource.product_name, new_resource.habitat_package)
     if installed == new_resource.version
       Chef::Log.debug("chef_client_updater_enterprise_install: #{new_resource.product_name} #{new_resource.version} already installed, skipping.")
+      # NOTE: do NOT `return` here. This early-out only means the package
+      # itself needs no (re)install — it must NOT skip scheduler
+      # reconvergence below. An earlier version of this action did return
+      # here, which meant that on any converge where chef-ice was already at
+      # the pinned version (i.e. every converge after the first), the
+      # scheduler resources' own chef_binary_path was never explicitly set
+      # and instead fell back to that resource's own built-in default —
+      # which varies by which Chef Infra Client gem happens to be bootstrapping
+      # that specific run (a hardcoded legacy omnibus path on pre-19.x gems,
+      # a lazy hab-aware default on chef-ice's own bundled gem). That
+      # divergence is exactly what produced the platform-inconsistent
+      # chef_binary_path flip-flop seen in CI: whichever gem happened to be
+      # running for a given converge/platform determined which stale/varying
+      # value got left in place, since nothing overrode it once this action
+      # returned early. Falling through to the shared reconvergence logic at
+      # the end of this action (guarded by resolved_binary_path/File.exist?)
+      # instead ensures exactly one canonical, stable path is (re-)asserted
+      # on every converge, install or no-op alike.
+      reconverge_installed_scheduler_resources(new_resource)
       return
     end
   end
@@ -551,8 +653,8 @@ action :install do
     sensitive true
     only_if { ::File.exist?('/hab/migration/bin/migrate-ice') }
     only_if { ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').any? }
-    retries 3
-    retry_delay 5
+    retries 5
+    retry_delay 10
     # `execute` has no built-in idempotency of its own — without this guard it
     # unconditionally re-runs migrate-ice on every single converge, even when
     # rpm_package/dpkg already correctly reported "up to date" for the same
@@ -599,58 +701,5 @@ action :install do
     end
   end
 
-  # Capture locals outside the plain-Ruby call below (not strictly required now that
-  # reconvergence is a direct method call rather than a closure captured by a ruby_block, but
-  # kept for clarity/consistency with the rest of this action).
-  # Deliberately NOT chef_client_binlink_path (the mutable /usr/bin/chef-client symlink) — see
-  # ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path for why scheduler resources
-  # must be pointed at the resolved, immutable, fully-versioned Habitat path instead.
-  # Pass new_resource.version so a user pinning to an older, specific version (e.g. to
-  # work around a bug in the latest release) doesn't get silently overridden by a newer
-  # version that may already be present on disk from an earlier install/run.
-  resolved_binary_path = chef_client_hab_binary_path(new_resource.habitat_package, new_resource.version)
-  update_scheduler_enabled = new_resource.update_scheduler_resources
-  # run_context here is a CHILD RunContext scoped to this action's own nested resource
-  # declarations (empty of sibling recipe-level resources even in unified_mode) — only
-  # root_run_context.resource_collection reaches the full, shared, recipe-level collection.
-  resource_collection = run_context.root_run_context.resource_collection
-
-  if update_scheduler_enabled && resolved_binary_path.nil?
-    Chef::Log.warn(
-      'chef_client_updater_enterprise: update_scheduler_resources is true but no installed ' \
-      "#{new_resource.habitat_package} Habitat package was found to resolve a chef_binary_path from."
-    )
-  end
-
-  # Runs unconditionally on every converge (not gated behind a notification) specifically so it
-  # self-heals on a later no-op converge too, not just the converge that actually
-  # installs/upgrades chef-ice. The individual chef_client_cron/systemd_timer/launchd/
-  # scheduled_task resources are declared with no explicit chef_binary_path in user recipes, so
-  # their own built-in lazy default re-evaluates every single time their action is re-run — on an
-  # older bootstrap chef-client (pre-19.x) that default is a hardcoded legacy omnibus path (see
-  # comment on reconverge_scheduler_resources above), so if this only ran when notified by an
-  # actual chef-ice change, any later unrelated converge would silently flip the scheduler's
-  # binary path back to that stale default with nothing left to correct it. Running every converge
-  # instead means reconverge_scheduler_resources always re-asserts resolved_binary_path, so the
-  # scheduler resource's own idempotency (each resource's underlying template/cron_d/systemd_unit
-  # compares rendered content, not "did chef-ice change this run") is what actually determines
-  # whether anything reports a diff. resolved_binary_path only changes when a NEW chef-ice version
-  # is actually installed (chef_client_hab_binary_path always resolves the latest installed
-  # version's directory), so this can never itself cause a false "not idempotent" result on an
-  # unrelated converge.
-  #
-  # Deliberately a plain Ruby call, NOT a `ruby_block` resource: `Chef::Provider::RubyBlock#
-  # action_run` unconditionally wraps `new_resource.block.call` in `converge_by`, which marks
-  # the ruby_block resource itself "updated" on every single converge regardless of what the
-  # block's own return value or internal `updated_by_last_action` calls indicate — confirmed by
-  # reading chef-ice's own bundled chef gem's `lib/chef/provider/ruby_block.rb`. That made this
-  # step permanently report itself as a change every converge, which broke the CI idempotency
-  # check (`2/17 resources updated` on every second converge, forever) even when
-  # reconverge_scheduler_resources itself found nothing to change. Since the whole resource is
-  # `unified_mode true`, calling this directly as plain Ruby inside the action body runs at
-  # exactly the same point in convergence a `ruby_block` would have, without a wrapper resource
-  # that can misreport its own idempotency.
-  if update_scheduler_enabled && resolved_binary_path && ::File.exist?(resolved_binary_path)
-    reconverge_scheduler_resources(resource_collection, resolved_binary_path)
-  end
+  reconverge_installed_scheduler_resources(new_resource)
 end

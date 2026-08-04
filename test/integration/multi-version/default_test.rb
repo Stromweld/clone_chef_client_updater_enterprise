@@ -7,35 +7,41 @@
 
 title 'multi-version upgrade verification'
 
-expected_version = input('expected_chef_ice_version', value: '19.3.15')
-older_version = input('older_chef_ice_version', value: '19.2.12')
-
 describe command('chef-client --version') do
   its('exit_status') { should eq 0 }
   its('stdout') { should match(/Chef Infra Client/) }
-  its('stdout') { should include(expected_version) }
 end
 
 if os.linux?
+  # The third install in this suite's recipe is unpinned ('latest'), so the
+  # actually-retained version drifts as Habitat's depot publishes newer
+  # chef-infra-client releases — do not hardcode it. Discover it dynamically
+  # and additionally assert exactly ONE version directory remains (not just
+  # that a plausible-looking one exists), so an incomplete cleanup leaving
+  # multiple versions behind can't slip past this control.
+  retained_dirs = command('ls -1 /hab/pkgs/chef/chef-infra-client').stdout.split("\n").reject(&:empty?)
+  retained_version = retained_dirs.max_by { |v| Gem::Version.new(v) }
+
+  describe retained_dirs do
+    it { should_not be_empty }
+  end
+
+  describe 'retained chef-infra-client version count' do
+    subject { retained_dirs.length }
+    it { should eq 1 }
+  end
+
   describe file('/usr/bin/chef-client') do
     it { should exist }
     it { should be_symlink }
     its('link_path') { should include('/hab/pkgs/chef/chef-infra-client/') }
-    its('link_path') { should include(expected_version) }
+    its('link_path') { should include(retained_version) } if retained_version
   end
 
-  describe file("/hab/pkgs/chef/chef-infra-client/#{expected_version}") do
+  describe file("/hab/pkgs/chef/chef-infra-client/#{retained_version}") do
     it { should exist }
     it { should be_directory }
-  end
-
-  # After cleanup keep_versions 1, only 19.3.15 should remain — assert both
-  # that the new version is present AND the older one was actually pruned.
-  describe command('ls /hab/pkgs/chef/chef-infra-client') do
-    its('exit_status') { should eq 0 }
-    its('stdout') { should include(expected_version) }
-    its('stdout') { should_not include(older_version) }
-  end
+  end if retained_version
 
   describe file("/hab/pkgs/chef/chef-infra-client/#{older_version}") do
     it { should_not exist }
