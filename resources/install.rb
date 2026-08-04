@@ -684,9 +684,8 @@ action :install do
     action :nothing
   end
 
-  binlinks_resource = nil
   if new_resource.manage_binlinks
-    binlinks_resource = chef_client_updater_enterprise_binlinks 'default' do
+    chef_client_updater_enterprise_binlinks 'default' do
       habitat_package new_resource.habitat_package
       action :create
     end
