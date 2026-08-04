@@ -285,25 +285,6 @@ action :install do
     installed = current_installed_version(new_resource.product_name, new_resource.habitat_package)
     if installed == new_resource.version
       Chef::Log.debug("chef_client_updater_enterprise_install: #{new_resource.product_name} #{new_resource.version} already installed, skipping.")
-      # NOTE: do NOT `return` here. This early-out only means the package
-      # itself needs no (re)install — it must NOT skip scheduler
-      # reconvergence below. An earlier version of this action did return
-      # here, which meant that on any converge where chef-ice was already at
-      # the pinned version (i.e. every converge after the first), the
-      # scheduler resources' own chef_binary_path was never explicitly set
-      # and instead fell back to that resource's own built-in default —
-      # which varies by which Chef Infra Client gem happens to be bootstrapping
-      # that specific run (a hardcoded legacy omnibus path on pre-19.x gems,
-      # a lazy hab-aware default on chef-ice's own bundled gem). That
-      # divergence is exactly what produced the platform-inconsistent
-      # chef_binary_path flip-flop seen in CI: whichever gem happened to be
-      # running for a given converge/platform determined which stale/varying
-      # value got left in place, since nothing overrode it once this action
-      # returned early. Falling through to the shared reconvergence logic at
-      # the end of this action (guarded by resolved_binary_path/File.exist?)
-      # instead ensures exactly one canonical, stable path is (re-)asserted
-      # on every converge, install or no-op alike.
-      reconverge_installed_scheduler_resources(new_resource)
       return
     end
   end
@@ -664,6 +645,7 @@ action :install do
     # itself dependent on migrate-ice having already run), so checking via the
     # `hab` binary here would create a chicken-and-egg dependency.
     not_if { pkg_version && hab_pkg_dirs(new_resource.habitat_package).any? { |d| d.split('/')[-2] == pkg_version } }
+    notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
   end
 
   # migrate-ice unpacks a Habitat `hab` package (chef/hab if bundled, else
@@ -694,12 +676,19 @@ action :install do
     end
   end
 
+  # Update any chef_client_scheduled_task/chef_client_cron/chef_client_launchd/chef_client_systemd_timer resources
+  # declared in the resources collection to point at the newly-installed Habitat binary path to run the new client on it's next run.
+  # This will reconverge the scheduler resource that was found with the new binary path.
+  ruby_block 'reconverge installed scheduler resources' do
+    block { reconverge_installed_scheduler_resources(new_resource) }
+    action :nothing
+  end
+
+  binlinks_resource = nil
   if new_resource.manage_binlinks
-    chef_client_updater_enterprise_binlinks 'default' do
+    binlinks_resource = chef_client_updater_enterprise_binlinks 'default' do
       habitat_package new_resource.habitat_package
       action :create
     end
   end
-
-  reconverge_installed_scheduler_resources(new_resource)
 end

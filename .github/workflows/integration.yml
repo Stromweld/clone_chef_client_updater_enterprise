@@ -15,7 +15,7 @@ env:
   CHEF_LICENSE_KEY: ${{ vars.CHEF_LICENSE_KEY }}
 
 jobs:
-  integration:
+  dokken:
     env:
       KITCHEN_LOCAL_YAML: kitchen.dokken.yml
     runs-on: ubuntu-latest
@@ -48,32 +48,116 @@ jobs:
         run: |
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
       - name: Kitchen Converge again (idempotency check)
-        # multi-version deliberately installs/prunes a different Habitat version on
-        # every converge (see test/cookbooks/.../recipes/multi_version.rb) — it will
-        # never be idempotent by design, so skip the check for that suite only.
-        #
-        # remove-omnibus is also excluded: kitchen-dokken's provisioner hardcodes
-        # `chef_binary: /opt/chef/bin/chef-client` for every top-level `kitchen
-        # converge` invocation (see vendor/gems/kitchen-dokken-*/lib/kitchen/
-        # provisioner/dokken.rb), which is how the *first* converge legitimately
-        # bootstraps against the base image's pre-baked omnibus chef-client. But
-        # this suite's entire purpose is to delete /opt/chef by the end of that
-        # first converge (see resources/remove_omnibus.rb) — a second top-level
-        # `kitchen converge` has no omnibus binary left to bootstrap from and
-        # fails immediately with "No such file or directory @ /opt/chef/bin/
-        # chef-client". The suite's own `post_converge` lifecycle hook in
-        # kitchen.yml already performs the genuinely separate second chef-client
-        # run needed to complete the deferred removal, invoking the cookbook's
-        # own stable binlink instead - that hook runs on every single `kitchen
-        # converge`, so idempotency of the underlying resources is still
-        # exercised, just not via a second top-level `kitchen converge`.
-        if: matrix.suite != 'multi-version' && matrix.suite != 'remove-omnibus'
+        # A second top-level `kitchen converge` always re-bootstraps via
+        # kitchen-dokken's fixed omnibus binary (`chef_binary:
+        # /opt/chef/bin/chef-client`), regardless of what the first converge
+        # installed — so it can never validate real second-run idempotency
+        # here. Instead, this step invokes the cookbook's own stable binlink
+        # (`/usr/bin/chef-client`, resolved to confirm it's Habitat-backed)
+        # directly — exactly as the next scheduled/manual run would — and
+        # requires that single second run to be fully idempotent
+        # (`0/N resources updated`). Uniform for every suite except
+        # multi-version, which deliberately installs a different Habitat
+        # version on every converge and is never idempotent by design.
+        if: matrix.suite != 'multi-version'
         run: |
-          kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | tee /tmp/second-converge.log
-          if grep -qE '[1-9][0-9]*/[0-9]+ resources updated' /tmp/second-converge.log; then
-            echo "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} reported resource changes — cookbook is not idempotent"
+          set -euo pipefail
+
+          instance="${{ matrix.suite }}-${{ matrix.os }}"
+          container="$(docker ps --format '{{.Names}}' | grep -m1 "${instance}$")"
+          test -n "$container" || { echo "::error::Dokken container not found for $instance"; exit 1; }
+
+          binlink=/usr/bin/chef-client
+          resolved="$(docker exec "$container" readlink -f "$binlink")"
+          case "$resolved" in
+            /hab/pkgs/chef/chef-infra-client/*/bin/chef-client) ;;
+            *) echo "::error::$binlink is not Habitat-backed: $resolved"; exit 1 ;;
+          esac
+
+          log="${RUNNER_TEMP}/idempotency-${instance}.log"
+          docker exec \
+            -e CHEF_LICENSE=accept-no-persist \
+            -e HAB_LICENSE=accept-no-persist \
+            -e CHEF_LICENSE_KEY="${{ vars.CHEF_LICENSE_KEY }}" \
+            "$container" sh -c '
+              export TEST_KITCHEN=1 IS_KITCHEN=true
+              root=/tmp/kitchen
+              [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen
+              exec /usr/bin/chef-client \
+                --local-mode \
+                --config "$root/client.rb" \
+                --json-attributes "$root/dna.json" \
+                --no-color
+            ' >"$log" 2>&1 || { echo "::error::Habitat-backed second run of $instance failed"; cat "$log"; exit 1; }
+
+          if ! grep -qE 'Infra Phase complete, 0/[1-9][0-9]* resources updated' "$log"; then
+            echo "::error::Habitat-backed second run of $instance was not idempotent"
+            cat "$log"
             exit 1
           fi
+      - name: Kitchen Verify
+        run: |
+          kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+
+  windows:
+    env:
+      KITCHEN_LOCAL_YAML: kitchen.proxy.yml
+      machine_port: 5985
+      machine_user: test_user
+      machine_pass: Pass@word1
+
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        os:
+          - localhost
+        suite:
+          - default
+          - preserve-omnibus
+          - multi-version
+          - scheduler-fix
+          - remove-omnibus
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Install Chef
+        uses: actionshub/chef-install@main
+        with:
+          license: ${{ vars.CHEF_LICENSE_KEY }}
+          chefDownloadUrl: chefdownload-commercial.chef.io
+          project: chef-workstation-enterprise
+          version: latest
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        run: |
+          # Enable Windows long paths
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+          # Enable Git long paths
+          git config --global core.longpaths true
+      - name: Setup Machine
+        run: |
+          winrm.cmd quickconfig -q
+          net user /add ${{ env.machine_user }} ${{ env.machine_pass }}
+          net localgroup administrators ${{ env.machine_user }} /add
+      - name: Kitchen Converge
+        run: |
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Kitchen Converge again (idempotency check)
+        if: matrix.suite != 'multi-version' && matrix.suite != 'remove-omnibus'
+        shell: pwsh
+        run: |
+          $logPath = Join-Path $env:RUNNER_TEMP 'second-converge.log'
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | Tee-Object -FilePath $logPath
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} failed"
+            exit $LASTEXITCODE
+          }
+          if (Select-String -Path $logPath -Pattern '[1-9][0-9]*/[0-9]+ resources updated' -Quiet) {
+            Write-Host "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} reported resource changes — cookbook is not idempotent"
+            exit 1
+          }
       - name: Kitchen Verify
         run: |
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
