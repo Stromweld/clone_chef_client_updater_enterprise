@@ -106,7 +106,7 @@ jobs:
     strategy:
       matrix:
         os:
-          - localhost
+          - windows-latest
         suite:
           - default
           - preserve-omnibus
