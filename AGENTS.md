@@ -105,15 +105,7 @@ those are the responsibility of `chef_client_updater_enterprise_cleanup`. Do not
 removal logic to this resource; keep the "remove the old thing" and "manage the new thing"
 responsibilities separate.
 
-Linux uses the native `package '<legacy_omnibus_package>' do action :remove end` (idempotent,
-proper up-to-date reporting) rather than shelling out to `rpm`/`dpkg` directly. An earlier version
-avoided the native resource over a concern that `dnf_package`'s `dnf_helper.py` (bundled with the
-`chef` gem itself, resolved relative to whichever gem is currently loaded — see
-`Chef::Provider::Package::Dnf::PythonHelper::DNF_HELPER`) might be missing after `migrate-ice`. That
-concern doesn't apply here: removal only ever runs once we're already confirmed to be running under
-chef-ice (see the `running_under_omnibus?` guard below), so the currently-loaded chef gem — and
-therefore `dnf_helper.py` — is chef-ice's own bundled copy, never the (possibly-altered) omnibus
-one.
+### Guard Conditions
 
 The resource defers (logs a warning and returns) rather than acting when either:
 - The currently running `chef-client` process is itself executing from the legacy omnibus install
@@ -123,12 +115,42 @@ The resource defers (logs a warning and returns) rather than acting when either:
   omnibus fallback should never be torn down before its Habitat-based replacement is confirmed
   present.
 
-When `remove_directories` is true, it also deletes:
+### Linux Behavior
 
-- Linux/macOS: `/opt/chef` only (not `/opt/chef-ice` — chef-ice has no such directory; its payload
-  lives under `/hab/pkgs/`)
-- Windows: `C:\opscode\chef`
-- macOS: runs `pkgutil --forget com.chef.chef` only if that receipt is currently registered
+Uses the native `package '<legacy_omnibus_package>' do action :remove end` (idempotent, proper
+up-to-date reporting) rather than shelling out to `rpm`/`dpkg` directly.
+
+When `remove_directories` is true, also deletes `/opt/chef` only (not `/opt/chef-ice` — chef-ice
+has no such directory; its payload lives under `/hab/pkgs/`). See "Mount-Point Edge Case" below for
+the case where `/opt/chef` is a dedicated mount point.
+
+### macOS Behavior
+
+Also removes the legacy package via the native package manager (see "Linux Behavior" above for the
+mechanism). When `remove_directories` is true, it also:
+
+- Deletes `/opt/chef` only (same path and mount-point caveat as Linux — see "Mount-Point Edge Case"
+  below).
+- Runs `pkgutil --forget com.chef.chef` only if that receipt is currently registered.
+
+### Windows Behavior
+
+When `remove_directories` is true, deletes `C:\opscode\chef`.
+
+**Windows package uninstall discovers the display name first, then uses `windows_package`.**
+`Chef::Provider::Package::Windows::RegistryUninstallEntry.find_entries` (Chef core) matches the
+Programs-and-Features *display* name via **exact string equality**, not the `legacy_omnibus_package`
+property value (`chef`, which only applies to the rpm/dpkg native package name in the Linux branch)
+— the omnibus MSI registers as `Chef Infra Client v<version>`, and that version varies per box. The
+`legacy_omnibus_display_name` helper runs `Get-Package -Name 'Chef Infra Client*'` (wildcard search,
+via `shell_out` with argv-array form to avoid shell quoting/injection) to discover the exact
+currently-installed display name, filtering out anything matching `chef-ice`/`air-gapped` since
+chef-ice's own MSI entry also starts with `Chef Infra` — a broader wildcard risks matching it too.
+That discovered name is then passed to `windows_package '<discovered name>' do action :remove end`
+for native, idempotent removal. Do not "simplify" this back to a hardcoded name or to reusing
+`new_resource.legacy_omnibus_package` directly — neither will match the registry entry.
+
+### Mount-Point Edge Case
 
 **`/opt/chef` may itself be a dedicated mount point — never `rmdir` it, only empty its contents.**
 Some customers deliberately mount a separate block device at `/opt/chef` to keep the omnibus
@@ -145,21 +167,18 @@ of ever calling `directory action :delete` on the mount point itself. When `/opt
 non-mounted directory (the common case), the original single `directory action :delete` path is
 used unchanged.
 
-**Windows package uninstall discovers the display name first, then uses `windows_package`.**
-`Chef::Provider::Package::Windows::RegistryUninstallEntry.find_entries` (Chef core) matches the
-Programs-and-Features *display* name via **exact string equality**, not the `legacy_omnibus_package`
-property value (`chef`, which only applies to the rpm/dpkg native package name in the Linux branch)
-— the omnibus MSI registers as `Chef Infra Client v<version>`, and that version varies per box. The
-`legacy_omnibus_display_name` helper runs `Get-Package -Name 'Chef Infra Client*'` (wildcard search,
-via `shell_out` with argv-array form to avoid shell quoting/injection) to discover the exact
-currently-installed display name, filtering out anything matching `chef-ice`/`air-gapped` since
-chef-ice's own MSI entry also starts with `Chef Infra` — a broader wildcard risks matching it too.
-That discovered name is then passed to `windows_package '<discovered name>' do action :remove end`
-for native, idempotent removal. Do not "simplify" this back to a hardcoded name or to reusing
-`new_resource.legacy_omnibus_package` directly — neither will match the registry entry.
+### Historical Notes
 
-**History — why the `remove-omnibus` Test Kitchen suite needs a second chef-client pass.** Before
-the `Kernel.exec`/`exit(213)` process handoff was replaced with in-place scheduler resource
+**Why Linux doesn't shell out to `rpm`/`dpkg` directly.** An earlier version avoided the native
+`package` resource over a concern that `dnf_package`'s `dnf_helper.py` (bundled with the `chef` gem
+itself, resolved relative to whichever gem is currently loaded — see `Chef::Provider::Package::Dnf::
+PythonHelper::DNF_HELPER`) might be missing after `migrate-ice`. That concern doesn't apply here:
+removal only ever runs once we're already confirmed to be running under chef-ice (see "Guard
+Conditions" above), so the currently-loaded chef gem — and therefore `dnf_helper.py` — is chef-ice's
+own bundled copy, never the (possibly-altered) omnibus one.
+
+**Why the `remove-omnibus` Test Kitchen suite needs a second chef-client pass.** Before the
+`Kernel.exec`/`exit(213)` process handoff was replaced with in-place scheduler resource
 reconvergence (see "Scheduler Resource Reconvergence" below), that handoff had an unrelated side
 effect: it forced a second, full chef-client run under chef-ice within the same `kitchen converge`,
 which is when `remove_omnibus`'s deferred deletion actually completed. Without it, `running_under_
@@ -486,9 +505,14 @@ Running the `ruby_block` every converge instead means `reconverge_scheduler_reso
 re-asserts `resolved_binary_path` on the scheduler resources' `chef_binary_path`, so whether this
 run is "idempotent" is determined purely by whether the individual scheduler resources' own
 underlying templates/cron_d/systemd_unit/scheduled_task content already matches. `resolved_binary_path`
-(from `chef_client_hab_binary_path`) only changes when a genuinely new chef-ice version is
-installed — it always resolves to the newest installed version's directory — so this can never
-itself introduce a false "not idempotent" result on an otherwise-unrelated converge. The individual
+(from `chef_client_hab_binary_path`) only changes when the package it actually resolves to changes:
+for the default `version: 'latest'` case that means a genuinely new chef-ice version was installed
+(it resolves to the newest installed version's directory); for an explicitly pinned `version` it
+stays fixed to that pinned version's directory regardless of what else gets installed (see
+"`chef_client_hab_binary_path` takes the resource's `version` property..." above). Either way, an
+otherwise-unrelated converge that changes neither the installed packages nor the pinned `version`
+can never see `resolved_binary_path` change, so this can never itself introduce a false "not
+idempotent" result. The individual
 `notifies :run, 'ruby_block[...]', :immediately` declarations on the package-install resources and
 on `chef_client_updater_enterprise_binlinks` have been removed entirely — they're now fully
 redundant (the block already runs every converge unconditionally) and kept the misleading

@@ -179,7 +179,6 @@ action_class do
     any_updated
   end
 
-
   def reconverge_installed_scheduler_resources(new_resource)
     resolved_binary_path = chef_client_hab_binary_path(new_resource.habitat_package, new_resource.version)
     update_scheduler_enabled = new_resource.update_scheduler_resources
