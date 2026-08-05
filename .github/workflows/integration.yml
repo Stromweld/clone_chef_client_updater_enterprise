@@ -139,11 +139,13 @@ jobs:
           net localgroup administrators ${{ env.machine_user }} /add
       - name: Kitchen Converge
         run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
       - name: Kitchen Converge again (idempotency check)
         if: matrix.suite != 'multi-version' && matrix.suite != 'remove-omnibus'
         shell: pwsh
         run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
           $logPath = Join-Path $env:RUNNER_TEMP 'second-converge.log'
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | Tee-Object -FilePath $logPath
           if ($LASTEXITCODE -ne 0) {
@@ -156,4 +158,5 @@ jobs:
           }
       - name: Kitchen Verify
         run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
