@@ -83,11 +83,7 @@ jobs:
               export TEST_KITCHEN=1 IS_KITCHEN=true
               root=/tmp/kitchen
               [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen
-              exec /usr/bin/chef-client \
-                --local-mode \
-                --config "$root/client.rb" \
-                --json-attributes "$root/dna.json" \
-                --no-color
+              exec /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"
             ' >"$log" 2>&1 || { echo "::error::Habitat-backed second run of $instance failed"; cat "$log"; exit 1; }
 
           if ! grep -qE 'Infra Phase complete, 0/[1-9][0-9]* resources updated' "$log"; then

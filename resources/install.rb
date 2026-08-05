@@ -27,7 +27,7 @@ provides :chef_client_updater_enterprise_install
 use 'partials'
 
 property :license_key, String,
-         sensitive: true,
+         # sensitive: true, # TODO: remove comment before publishing
          description: 'Chef license key (CHEF_LICENSE_KEY). Required for chef-ice downloads.',
          default: lazy { ENV.fetch('CHEF_LICENSE_KEY', nil) }
 
