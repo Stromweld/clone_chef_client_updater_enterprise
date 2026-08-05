@@ -54,36 +54,29 @@ Use `Policyfile.rb` for dependency resolution. Do not reintroduce Berkshelf file
 
 ## Unit Testing (ChefSpec/RSpec)
 
-`spec/unit/` holds fast ChefSpec/RSpec tests (run via `chef exec rspec`, no Gemfile needed — Chef
-Workstation bundles ChefSpec/RSpec). This cookbook has no `recipes/` directory, so `ChefSpec::
-SoloRunner#converge_block` alone never registers its custom resources (Chef only compiles library/
-resource files for cookbooks named in the run_list — see `Chef::RunContext::CookbookCompiler#
-cookbook_order`). `spec/spec_helper.rb`'s `converge_resource` helper works around this via
-`spec/fixtures/cookbooks/chefspec_shim`, a throwaway cookbook that `depends` on this one and has a
-single empty recipe; converging it pulls this cookbook's resources into `cookbook_order` without
-executing any of its actual resource actions.
+`spec/unit/` holds ChefSpec/RSpec tests, run via `chef exec rspec` (Chef Workstation bundles
+ChefSpec/RSpec — no Gemfile needed).
 
-`testing/` (this cookbook's real parent directory) is deliberately **not** used as ChefSpec's
-`cookbook_path` — it also contains a `clone_chef_client_updater_enterprise` sibling with the same
-cookbook name, which Chef's `CookbookLoader` refuses to merge. Instead, `spec/fixtures/cookbooks/
-chef_client_updater_enterprise/{metadata.rb,resources,libraries}` are individual **per-file**
-symlinks back to this cookbook's real files. Do not replace these with directory-level symlinks:
-`Dir.glob` (what Chef's cookbook loader uses) does not recurse into symlinked directories, only
-symlinked files, so `resources`/`libraries` must stay real directories containing per-file symlinks.
-**Whenever a resource or library file is added, removed, or renamed, add/update the matching symlink
-under `spec/fixtures/cookbooks/chef_client_updater_enterprise/`** — `spec/unit/fixture_sync_spec.rb`
-fails loudly if the symlinked set drifts from the real one.
+This cookbook has no `recipes/` directory, so ChefSpec never registers its custom resources on its
+own (Chef only compiles library/resource files for cookbooks named in the run_list).
+`spec/spec_helper.rb`'s `converge_resource` helper works around this by converging a throwaway
+`spec/fixtures/cookbooks/chefspec_shim` cookbook that `depends` on this one.
 
-Since `chef_client_updater_enterprise_*` are custom resources, ChefSpec treats them as opaque no-ops
-unless told to `step_into` them — `converge_resource` defaults `step_into` to all four so their
-`action_class` code actually executes. `cleanup.rb` declares removal via uniquely-named `execute`
-resources (one per full Habitat ident, e.g. `execute["remove Habitat package
-chef/chef-infra-client/19.1.0/20260101090000"]`) rather than repeated `habitat_package` resources
-sharing one name — see "Cleanup Removal Uses Direct `hab pkg uninstall`, Not `habitat_package`"
-below for why. Because the full ident is baked into each resource's name, ordinary `(type, name)`
-lookup is already unambiguous per removed version; `spec/unit/resources/cleanup_spec.rb`'s
-`removed_idents` helper filters `chef_run.resource_collection.all_resources` by name prefix for
-clarity, not to work around a ChefSpec matcher collision.
+This cookbook's real parent directory can't be ChefSpec's `cookbook_path` if another checkout of
+this cookbook (declaring the same `chef_client_updater_enterprise` name in its own `metadata.rb`)
+is ever present alongside it — Chef's `CookbookLoader` refuses to merge duplicate cookbook names.
+Instead `spec/fixtures/cookbooks/chef_client_updater_enterprise/` holds
+**per-file** symlinks back to the real `metadata.rb`/`resources`/`libraries`. Do not replace these
+with directory-level symlinks — `Dir.glob` (used by Chef's cookbook loader) does not recurse into
+symlinked directories, only symlinked files. **Whenever a resource/library file is added, removed,
+or renamed, update the matching symlink** — `spec/unit/fixture_sync_spec.rb` fails if the symlinked
+set drifts from the real one.
+
+`converge_resource` defaults `step_into` to all four custom resources so their `action_class` code
+actually executes (ChefSpec otherwise treats custom resources as opaque no-ops). `cleanup.rb`
+declares removal via uniquely-named `execute` resources (one per full Habitat ident) rather than
+repeated `habitat_package` resources sharing one name — see "Cleanup Removal Uses Direct `hab pkg
+uninstall`" below.
 
 ## Sensitive Data
 
@@ -137,554 +130,289 @@ mechanism). When `remove_directories` is true, it also:
 
 When `remove_directories` is true, deletes `C:\opscode\chef`.
 
-**Windows package uninstall discovers the display name first, then uses `windows_package`.**
-`Chef::Provider::Package::Windows::RegistryUninstallEntry.find_entries` (Chef core) matches the
-Programs-and-Features *display* name via **exact string equality**, not the `legacy_omnibus_package`
-property value (`chef`, which only applies to the rpm/dpkg native package name in the Linux branch)
-— the omnibus MSI registers as `Chef Infra Client v<version>`, and that version varies per box. The
-`legacy_omnibus_display_name` helper runs `Get-Package -Name 'Chef Infra Client*'` (wildcard search,
-via `shell_out` with argv-array form to avoid shell quoting/injection) to discover the exact
-currently-installed display name, filtering out anything matching `chef-ice`/`air-gapped` since
-chef-ice's own MSI entry also starts with `Chef Infra` — a broader wildcard risks matching it too.
-That discovered name is then passed to `windows_package '<discovered name>' do action :remove end`
-for native, idempotent removal. Do not "simplify" this back to a hardcoded name or to reusing
-`new_resource.legacy_omnibus_package` directly — neither will match the registry entry.
+**Windows package uninstall discovers the display name first, then uses `windows_package`.** Chef
+core matches the Programs-and-Features *display* name via exact string equality, not the
+`legacy_omnibus_package` property (`chef`, which only applies to the Linux rpm/dpkg name) — the
+omnibus MSI registers as `Chef Infra Client v<version>`, which varies per box. The
+`legacy_omnibus_display_name` helper runs `Get-Package -Name 'Chef Infra Client*'` (via `shell_out`
+argv-array form, to avoid shell injection) to discover the exact display name, filtering out
+`chef-ice`/`air-gapped` matches since chef-ice's own MSI entry also starts with `Chef Infra`. That
+discovered name is then passed to `windows_package` for native, idempotent removal. Do not
+"simplify" this back to a hardcoded name or `new_resource.legacy_omnibus_package` directly — neither
+matches the registry entry.
 
 ### Mount-Point Edge Case
 
 **`/opt/chef` may itself be a dedicated mount point — never `rmdir` it, only empty its contents.**
-Some customers deliberately mount a separate block device at `/opt/chef` to keep the omnibus
-install isolated from the root drive image (confirmed reproducible: the official `chef/chef`
-Dokken/Docker test image itself declares `/opt/chef` as a Docker `VOLUME`). `directory <path> action
-:delete` on such a path is really an `rmdir()` on the mountpoint, which the kernel unconditionally
-refuses with `Errno::EBUSY` ("Device or resource busy") regardless of whether the directory is
-empty first — this is not something retries or `only_if` guards can work around. The
-`mount_point?(path)` helper in `libraries/helpers.rb` detects this (comparing `File.stat(path).dev`
-against its parent directory's device ID) and, when true, the resource iterates
-`Dir.children(omnibus_dir)` and deletes each entry individually with `file`/`directory` (chosen per
-entry via `File.directory?`, since e.g. `/opt/chef/LICENSE` is a plain file, not a directory) instead
-of ever calling `directory action :delete` on the mount point itself. When `/opt/chef` is a plain,
-non-mounted directory (the common case), the original single `directory action :delete` path is
-used unchanged.
+Some customers mount a separate block device at `/opt/chef` (the official `chef/chef` Dokken test
+image itself declares it as a Docker `VOLUME`). `directory action :delete` on a mount point is
+really an `rmdir()`, which the kernel unconditionally refuses with `Errno::EBUSY` regardless of
+whether the directory is empty — not something `only_if` guards or retries can work around. The
+`mount_point?(path)` helper (`libraries/helpers.rb`, comparing `File.stat(path).dev` against the
+parent's device ID) detects this and, when true, deletes each entry under `/opt/chef` individually
+via `file`/`directory` instead of ever calling `directory action :delete` on the mount point itself.
+Plain, non-mounted directories use the original single `directory action :delete` path unchanged.
 
 ### Historical Notes
 
-**Why Linux doesn't shell out to `rpm`/`dpkg` directly.** An earlier version avoided the native
-`package` resource over a concern that `dnf_package`'s `dnf_helper.py` (bundled with the `chef` gem
-itself, resolved relative to whichever gem is currently loaded — see `Chef::Provider::Package::Dnf::
-PythonHelper::DNF_HELPER`) might be missing after `migrate-ice`. That concern doesn't apply here:
-removal only ever runs once we're already confirmed to be running under chef-ice (see "Guard
-Conditions" above), so the currently-loaded chef gem — and therefore `dnf_helper.py` — is chef-ice's
-own bundled copy, never the (possibly-altered) omnibus one.
+**Linux uses the native `package` resource, not `dnf_package`/`rpm`/`dpkg` directly.** An earlier
+concern that `dnf_package`'s bundled `dnf_helper.py` might be missing after `migrate-ice` doesn't
+apply: removal only runs once already confirmed under chef-ice (see "Guard Conditions" above), so
+the loaded chef gem's `dnf_helper.py` is always chef-ice's own copy.
 
-**Why the `remove-omnibus` Test Kitchen suite needs a second chef-client pass.** Before the
-`Kernel.exec`/`exit(213)` process handoff was replaced with in-place scheduler resource
-reconvergence (see "Scheduler Resource Reconvergence" below), that handoff had an unrelated side
-effect: it forced a second, full chef-client run under chef-ice within the same `kitchen converge`,
-which is when `remove_omnibus`'s deferred deletion actually completed. Without it, `running_under_
-omnibus?` stays true for the entire lifetime of the converging process, so a single converge can
-never complete the removal — this is expected, not a bug, and is why `kitchen.yml`'s `remove-omnibus`
-suite carries a `lifecycle: post_converge:` hook that runs a second, genuinely separate chef-client
-invocation directly against the cookbook's own stable binlink path (`chef_client_binlink_path`),
-bypassing Test Kitchen's own executable-discovery (`chef_client_path`/`find_chef_executable` in
-`kitchen-chef-enterprise`) entirely. That discovery mechanism resolves `config[:chef_client_path]`
-(defaulting to the omnibus path) once per `kitchen converge` invocation and would otherwise keep
-resolving back to omnibus forever, since removal is gated on the same "not running under omnibus"
-check the discovery mechanism itself would never flip. `multiple_converge` cannot substitute for
-this either — it chains N chef-client invocations against a single executable path resolved once,
-not per invocation, so it can never pick up chef-ice mid-chain. Do not remove this hook or attempt
-to make `remove_omnibus` complete in a single converge; that would require changing its guard logic,
-which is deliberately out of scope (see the resource description above).
+**The `remove-omnibus` Test Kitchen suite needs a second chef-client pass.** A single converge can
+never complete the deferred removal, since `running_under_omnibus?` stays true for the whole life
+of the converging process — this is expected. `kitchen.yml`'s `remove-omnibus` suite therefore
+carries a `lifecycle: post_converge:` hook that runs a second, separate chef-client invocation
+against the cookbook's own stable binlink path (`chef_client_binlink_path`), bypassing Test
+Kitchen's own executable-discovery (which would otherwise keep resolving back to the omnibus path).
+Do not remove this hook or try to make `remove_omnibus` complete in a single converge.
 
-**The `remove-omnibus` `post_converge` hook must be wrapped in `sh -c '...'` under Dokken.**
-`kitchen-dokken`'s transport execs commands as a raw argv array (`Shellwords.shellwords(command)`,
-no shell involved) rather than through `/bin/sh`, so a bare `export FOO=1; export BAR=2; sudo ...`
-fails immediately with `exec: "export": executable file not found in $PATH` — `export` is a shell
-builtin, not a real binary on `$PATH`, and `;`-separated commands have no meaning without a shell to
-interpret them. The ssh-based transport used by `kitchen.yml`'s Vagrant suites already runs remote
-commands through a shell, so wrapping in `sh -c '...'` is a no-op there but required for Dokken. The
-hook also can't hardcode a single sandbox root path: the ssh/`chef_infra` provisioner (Vagrant)
-extracts to `/tmp/kitchen`, while the `dokken` provisioner extracts to `/opt/kitchen` — since this
-one `kitchen.yml` is shared by both drivers (`kitchen.dokken.yml` only overrides `driver`/
-`transport`/`provisioner` name, not `suites`), the hook probes for `/opt/kitchen/client.rb` and
-falls back to `/tmp/kitchen` otherwise, rather than assuming either path.
+**That `post_converge` hook must be wrapped in `sh -c '...'` under Dokken** — `kitchen-dokken`'s
+transport execs a raw argv array with no shell involved, so `export FOO=1; ...` fails with
+`exec: "export": executable file not found in $PATH`. The ssh-based Vagrant transport already runs
+through a shell, so the wrapper is a no-op there but required for Dokken. The hook also probes for
+`/opt/kitchen/client.rb` (Dokken sandbox root) and falls back to `/tmp/kitchen` (Vagrant), since
+both drivers share this one `kitchen.yml`.
 
-**`remove-omnibus` must be excluded from the CI idempotency check's *second top-level* `kitchen
-converge`** (`.github/workflows/integration.yml`), for a structural reason distinct from
-`multi-version`'s (which is excluded because it deliberately installs a different version every
-run). `kitchen-dokken`'s provisioner hardcodes `default_config :chef_binary,
-"/opt/chef/bin/chef-client"` for literally every top-level `kitchen converge` invocation — that's
-how the *first* converge legitimately bootstraps against the base Docker image's pre-baked omnibus
-chef-client. But this suite's entire purpose is to delete `/opt/chef` by the end of that first
-converge, so a second top-level `kitchen converge` has no omnibus binary left to bootstrap from and
-fails immediately with `Errno::ENOENT: /opt/chef/bin/chef-client`. This is NOT a regression or a
-missed idempotency check: the suite's own `post_converge` lifecycle hook above already performs the
-genuinely separate second chef-client run (via the stable chef-ice binlink, not the now-deleted
-omnibus binary) on every single `kitchen converge`, so the underlying resources' idempotency is
-still exercised — confirmed by manually re-invoking the hook's exact command a second time and
-observing `0/16 resources updated`. Do not remove this CI exclusion or try to make a second
-top-level `kitchen converge` work for this suite; the fix would require reconfiguring
-`kitchen-dokken`'s hardcoded `chef_binary` per-invocation, which the gem does not support.
+**`remove-omnibus` is excluded from the CI idempotency check's second top-level `kitchen
+converge`** — `kitchen-dokken` hardcodes `chef_binary: "/opt/chef/bin/chef-client"` for every
+top-level converge, but this suite deletes `/opt/chef` by the end of the first one, so a second
+top-level converge fails with `Errno::ENOENT`. This is expected, not a missed check: the suite's
+own `post_converge` hook already re-exercises idempotency via the stable chef-ice binlink on every
+converge. Do not remove this CI exclusion or try to make a second top-level converge work here.
 
 ## Platform Support
 
-`metadata.rb` declares broad OS-family support via `supports` (amazon, centos, debian, fedora,
-mac_os_x, opensuseleap, oracle, redhat, suse, ubuntu, windows). Actual Kitchen-tested platforms are
-narrower and currently: `almalinux-9` (Vagrant) / `rhel-9` (EC2) as the RHEL proxy,
-`opensuse-leap-15` and `opensuse-leap-16` as the SLES/SUSE proxy, `ubuntu-2404`, and `windows-2022`.
-`kitchen.yml` (Vagrant/local) and `kitchen.ec2.yml` (live EC2, used via
-`KITCHEN_LOCAL_YAML=kitchen.ec2.yml`) must keep matching platform names — `kitchen.ec2.yml` has no
-`provisioner:` key and inherits it from `kitchen.yml` via Test Kitchen's recursive config merge, but
-`platforms:` are looked up by matching `name:`, so a platform added to one file without the other
-simply won't be runnable in that mode.
+`metadata.rb` declares broad OS-family `supports`, but actual Kitchen-tested platforms are
+narrower: `almalinux-9` (Vagrant) / `rhel-9` (EC2) as the RHEL proxy, `opensuse-leap-15`/`-16` as
+the SLES/SUSE proxy, `ubuntu-2404`, and `windows-2022`. `kitchen.yml` (Vagrant) and `kitchen.ec2.yml`
+(`KITCHEN_LOCAL_YAML=kitchen.ec2.yml`) must keep matching platform `name:` values — `kitchen.ec2.yml`
+has no `provisioner:` key of its own and inherits it via Test Kitchen's recursive merge, but
+`platforms:` are looked up by name, so adding one to only one file makes it unrunnable in the other
+mode.
 
-Do not add a platform to any one of `metadata.rb`, `kitchen.yml`, `kitchen.ec2.yml`, or the README
-without also confirming `mixlib-install` publishes `chef-ice` artifacts for it.
+Do not add a platform anywhere without confirming `mixlib-install` publishes `chef-ice` artifacts
+for it.
 
-**`kitchen-ec2` (the gem) has NO built-in `opensuse` `Aws::StandardPlatform` support** (only
-rhel/centos/alma/rocky/debian/ubuntu/amazon/amazon2/amazon2023/fedora/windows/macos/freebsd are
-registered). When a platform name isn't recognized, `Ec2#default_ami` silently falls back to
-`Aws::StandardPlatform.from_platform_string(self, "ubuntu")` — **no error, no warning** — so an
-`opensuse-leap-*` EC2 platform without an explicit `image_id` will silently boot an Ubuntu AMI
-instead (confirmed live: `Detected platform: ubuntu version 26.04` in kitchen logs for an
-`opensuse-leap-16` instance). `kitchen.ec2.yml`'s `opensuse-leap-16` entry therefore pins an
-explicit `image_id`. General rule: any future non-standard platform name added to
-`kitchen.ec2.yml` must pin `image_id` explicitly unless it's one of kitchen-ec2's registered
-families above.
+**`kitchen-ec2` has no built-in `opensuse` `Aws::StandardPlatform` support.** An unrecognized
+platform name silently falls back to an Ubuntu AMI with no error — `kitchen.ec2.yml`'s
+`opensuse-leap-16` entry therefore pins an explicit `image_id`. Any future non-standard platform
+name added to `kitchen.ec2.yml` must do the same unless it's one of kitchen-ec2's registered
+families (rhel/centos/alma/rocky/debian/ubuntu/amazon/amazon2/amazon2023/fedora/windows/macos/freebsd).
 
-**openSUSE Leap 15.6 reached upstream EOL (2026-04-30) and its AWS AMI has been fully delisted**
-from `us-west-2` (confirmed via `aws ec2 describe-images` returning zero results across every
-owner). `opensuse-leap-15` has been removed from `kitchen.ec2.yml` entirely for this reason — it
-remains testable via Dokken only (container image availability is independent of AMI delisting).
+**openSUSE Leap 15.6 is EOL and its AWS AMI is delisted** — `opensuse-leap-15` has been removed
+from `kitchen.ec2.yml` (still testable via Dokken only).
 
-**Running the full Dokken + EC2 matrix concurrently (multiple `kitchen converge` processes against
-the same checkout) can corrupt/race `Policyfile.lock.json`** — `chef-cli install`/`update`
-read-modify-write that file with no interprocess locking, so 2+ concurrent converges produced a
-transient `NoMethodError: undefined method '[]' for nil`. Always run matrix-style multi-platform
-Kitchen testing fully serially (one `kitchen converge` at a time) against a single checkout, or use
-per-combo checkout copies if parallelism is required.
+**Never run the Dokken + EC2 matrix concurrently against the same checkout** — `chef-cli`
+read-modify-writes `Policyfile.lock.json` with no interprocess locking, so concurrent converges can
+corrupt it (`NoMethodError: undefined method '[]' for nil`). Run matrix testing fully serially, or
+use per-combo checkout copies.
 
 ## Preserving Multiple Installed Versions
 
-`chef-ice` packages (rpm, deb, and MSI) each bundle a `migrate-ice` tool that the native package
-manager's own install transaction invokes unconditionally, with no supported flag to add
-`--preserve-omnibus` or avoid deleting a previously installed version's Habitat directory. The
-`install` resource works around this per-platform so that installing a newer `chef-ice` version
-never deletes an older one still on disk, and the legacy omnibus install (if present) is preserved
-when `preserve_omnibus` is true:
+Every `chef-ice` package (rpm/deb/MSI) bundles a `migrate-ice` tool that the native package
+manager's install transaction invokes unconditionally, with no flag to preserve a previously
+installed version's Habitat directory. `install` works around this per-platform so a newer
+`chef-ice` never deletes an older one still on disk, and preserves the legacy omnibus install when
+`preserve_omnibus` is true:
 
-- **RHEL family (RHEL, Amazon Linux, Fedora, SLES/SUSE):** Uses Chef's `rpm_package` resource
-  directly (bypassing `dnf`/`yum`) with `--replacefiles --noscripts --nodigest`. `--noscripts`
-  suppresses the RPM's `%post` scriptlet (which always runs `migrate-ice` without
-  `--preserve-omnibus`); the resource then runs `migrate-ice` itself via a separate `execute`
-  resource. `--nodigest` is required in addition: `chef-ice`'s published RPM builds are always
-  built on an Amazon Linux 2 builder regardless of the target platform requested from
-  mixlib-install (confirmed live: `p=fedora`/`p=el`/`p=amazon` all resolve to the byte-identical
-  `chef-ice-*.amzn2.x86_64.rpm`, same sha256) and lack a modern per-file payload digest. Whether
-  that's rejected depends on the installed `rpm` binary's own `_pkgverify_level` default: rpm 4.x
-  (RHEL/Alma/Rocky 8/9, Amazon Linux) tolerates it silently, but Fedora 44's bundled rpm 6.0.2
-  defaults to `_pkgverify_level=digest` and hard-fails with `package ... does not verify: no
-  digest`. `--nodigest` disables only this specific payload-digest check — it does NOT skip the
-  SHA256 checksum already verified independently via `remote_file`'s `checksum` property, and does
-  not affect GPG signature verification (already skipped via `--noscripts`). Do not switch this
-  back to `package`/`dnf_package`/`yum_package` — those frontends erase a previous NEVRA's entire
-  file tree (including its versioned Habitat directory) as part of an upgrade transaction, which
-  can delete the very files the currently-running chef-client process is executing from mid-converge.
+- **RHEL family:** Uses `rpm_package` directly (bypassing `dnf`/`yum`) with `--replacefiles
+  --noscripts --nodigest`, then runs `migrate-ice` itself via a separate `execute`. `--noscripts`
+  suppresses the RPM's `%post` (which always runs `migrate-ice` without `--preserve-omnibus`).
+  `--nodigest` is required because `chef-ice`'s RPM is always built on an Amazon Linux 2 builder
+  regardless of target platform and lacks a modern per-file payload digest — rpm 4.x tolerates
+  this, but Fedora's rpm 6.x hard-fails without it. `--nodigest` does not skip the SHA256 checksum
+  (already verified via `remote_file`'s `checksum`) or GPG verification (already skipped via
+  `--noscripts`). Do not switch back to `package`/`dnf_package`/`yum_package` — those erase a
+  previous NEVRA's entire file tree (including its Habitat directory) during an upgrade.
 - **Debian family:** Drives `dpkg --unpack` then `dpkg --configure` directly, temporarily stubbing
-  `migrate-ice` (and, on upgrades, the previous package's `postrm`, which unconditionally
-  `rm -rf /hab`s under certain conditions) between the two phases. `dpkg -i` has no `--noscripts`
-  equivalent, so this two-phase approach is required to intercept the maintainer scripts.
-- **Windows:** Uses `windows_package` with `installer_type :msi`. Each `chef-ice` release has a
-  distinct MSI `ProductCode`/`UpgradeCode`, so side-by-side installs are already safe without any
-  special handling — only the `CHEF_PRESERVE_OMNIBUS=1` MSI property (via `options`) is needed,
-  which the package's embedded `PostInstall.ps1` forwards to `migrate-ice`. This property only
-  exists on `chef-ice` builds from ~2026-04-23 onward; older MSI releases always migrate
-  destructively. MSI installs can take 7-13 minutes — `timeout` defaults to `1800`.
+  `migrate-ice` (and, on upgrades, the previous package's `postrm`, which can `rm -rf /hab`)
+  between the two phases — `dpkg -i` has no `--noscripts` equivalent.
+- **Windows:** Uses `windows_package` (`installer_type :msi`). Each release has a distinct MSI
+  `ProductCode`/`UpgradeCode` so side-by-side installs are already safe; only the
+  `CHEF_PRESERVE_OMNIBUS=1` MSI property is needed (forwarded to `migrate-ice` by the package's
+  `PostInstall.ps1`). Only present on `chef-ice` builds from ~2026-04-23 onward — older MSIs always
+  migrate destructively. MSI installs can take 7-13 minutes; `timeout` defaults to `1800`.
 
-Do not "simplify" any of this back to a plain `package`/`dnf_package`/`apt_package` resource without
-re-verifying (ideally on a live multi-version Kitchen suite) that a previous version's files survive
-an upgrade — this exact regression is what these workarounds fix.
+Do not simplify any of this back to a plain `package`/`dnf_package`/`apt_package` resource without
+re-verifying on a live multi-version Kitchen suite that a previous version's files survive an
+upgrade.
 
 ## `migrate-ice apply airgap`'s `--fresh-install` Flag Is Conditional, Not Unconditional
 
-`chef_client_updater_enterprise_install`'s `execute[migrate-ice apply airgap]` resource decides
-whether to pass `--fresh-install` based on `chef_client_on_path?` (in `libraries/helpers.rb`), NOT
-unconditionally. This mirrors migrate-ice's OWN internal "is chef-client already installed?"
-detection exactly, which shells out to `chef-client` via `$PATH` (confirmed via
-`/var/log/chef19migrate.log` and direct binary testing against a live EC2 instance) rather than
-checking for `/opt/chef` on disk:
+`chef_client_updater_enterprise_install`'s `execute[migrate-ice apply airgap]` decides whether to
+pass `--fresh-install` based on `chef_client_on_path?` (in `libraries/helpers.rb`), mirroring
+migrate-ice's own internal "is chef-client already installed?" check (which shells out to
+`chef-client` via `$PATH`, not a check for `/opt/chef` on disk):
 
-- **`chef-client` on `$PATH`** (true for native package installs of omnibus Chef on real
-  VMs/EC2 — `/usr/bin/chef-client`, etc.): migrate-ice's non-fresh-install path runs a normal,
-  correctly-behaved migration — detects the existing version, extracts the bundle, populates
-  `/hab/pkgs`, and fully respects `--preserve-omnibus true` by gracefully logging `/opt/chef is
-  not mounted. Skipping --fstab flag handling.` rather than erroring, in the (overwhelmingly
-  common) case where `/opt/chef` is not its own dedicated mount point.
-- **`chef-client` NOT on `$PATH`** (normal for minimal Dokken/CI container images that invoke the
-  bootstrap chef-client by full path): the non-fresh-install path's own installed-check fails, so
-  `--fresh-install` is required to skip that check and just extract the bundle unconditionally.
+- **`chef-client` on `$PATH`** (native package installs on real VMs/EC2): the non-fresh-install
+  path runs a normal migration and fully respects `--preserve-omnibus true`.
+- **`chef-client` NOT on `$PATH`** (minimal Dokken/CI images invoking chef-client by full path):
+  the non-fresh-install path's installed-check fails, so `--fresh-install` is required to skip it
+  and extract the bundle unconditionally.
 
-**Both branches exit 0 either way** — this is exactly why getting it wrong went undetected for a
-while: an earlier version of this cookbook unconditionally passed `--fresh-install`, which silently
-no-ops on every EC2/native-VM converge where `chef-client` is resolvable via `$PATH`, leaving
-`/hab/pkgs` permanently empty. That in turn made `execute[migrate-ice apply airgap]`'s own `not_if`
-guard (checking `hab_pkg_dirs`) never satisfiable, so it re-ran (harmlessly but pointlessly, and
-looking like a `NOT_IDEMPOTENT` bug) on every single subsequent converge, forever. Confirmed
-root-caused via direct SSH onto a live EC2 `preserve-omnibus` instance (both `rhel-9` and
-`ubuntu-24.04`): `/hab/pkgs/chef/chef-infra-client/` did not exist despite rpm/dpkg correctly
-reporting chef-ice installed. NOT reproducible on Dokken, whose minimal images never have
-`chef-client` on `$PATH` to begin with — this asymmetry (EC2-only failure, Dokken always clean) was
-the initial clue.
+**Both branches exit 0 either way**, which is why getting this wrong goes undetected: passing
+`--fresh-install` unconditionally silently no-ops on EC2/native VMs (migrate-ice detects chef-client
+is already installed and refuses to run), leaving `/hab/pkgs` permanently empty and making
+`execute[migrate-ice apply airgap]`'s `not_if` never satisfiable (re-runs harmlessly every
+converge, forever).
 
 Do not go back to unconditionally passing `--fresh-install`, and do not gate the flag on
-`File.directory?('/opt/chef')` either (that reintroduces the older, now-removed mount-remount
-failure mode this comment used to warn about) — `chef_client_on_path?` is the one check that matches
-migrate-ice's own internal logic exactly.
+`File.directory?('/opt/chef')` either (reintroduces a mount-remount failure mode) —
+`chef_client_on_path?` is the one check that matches migrate-ice's own internal logic exactly.
 
 **`execute[migrate-ice apply airgap]` carries `retries 3` / `retry_delay 5`** to work around an
-upstream migrate-ice/Go-runtime bug, not a cookbook logic issue. Under CPU-constrained/virtualized/
-emulated environments (confirmed 100% reproducible in a local Dokken container running under qemu
-emulation on Apple Silicon; observed intermittently on real GitHub-hosted Actions runners too),
-migrate-ice can crash with a Go garbage-collector background-worker race — `fatal error:
-lfstack.push ... created by runtime.gcBgMarkStartWorkers`, exit code 2 — while extracting the
-~160MB airgap tarball. This happens regardless of the `--fresh-install`/`--preserve-omnibus` flag
-values (tested both combinations) and regardless of `GOMAXPROCS` (tested `GOMAXPROCS=1`, still
-crashed) — it is inherent to the flag itself under resource contention. The exact same command with
-the exact same flags and no other state change reliably succeeds on retry, so `retries`/
-`retry_delay` is the correct fix; do not attempt to "fix" this by altering the fresh-install/
-preserve-omnibus flag logic (already correct, see above) or by disabling GC tuning.
-
-
-**End-to-end verification (live EC2, full Kitchen converge+reconverge cycle):** Confirmed on
-`preserve-omnibus-ubuntu-2404` — first converge installed chef-ice and correctly populated
-`/hab/pkgs`; a second, independent converge reported `Infra Phase complete, 0/15 resources updated`
-(fully idempotent, `execute[migrate-ice apply airgap]` correctly skipped via its `not_if`). Note: an
-early version of the ad-hoc verification harness used for this check had its own bug — a naive
-`grep -qE "[1-9][0-9]* resources updated"` false-positived on the `15` in `0/15 resources updated`
-(total resource count, not the updated count), misreporting a fully idempotent run as
-`NOT_IDEMPOTENT`. Fixed by anchoring the regex to `Infra Phase complete, [1-9][0-9]*/[0-9]+ resources
-updated`. Not a cookbook bug — a lesson for anyone else scripting Kitchen-log-based idempotency
-checks against this cookbook's `Infra Phase complete, X/Y resources updated` output format.
-`preserve-omnibus-rhel-9` initially failed three consecutive times at the `chef_infra` provisioner's
-own initial omnibus Chef v18 bootstrap step (`kitchen.yml`'s `product_version: 18`) — before any of
-this cookbook's resources run at all — with a transient `Omnitruck artifact does not exist for
-version 18 on platform el` 404 from `chefdownload-commercial.chef.io`, despite the identical metadata
-URL succeeding reliably via direct `curl` from the orchestrating machine at the same time. On a
-fourth attempt (fresh AWS session), bootstrap succeeded cleanly and the full converge+reconverge+
-verify cycle passed: converge 1 installed chef-ice 19.3.15 (6/11 resources updated), converge 2
-reported `0/11 resources updated` (fully idempotent, `migrate-ice apply airgap` skipped via
-`not_if`), and `kitchen verify` passed all 9 InSpec checks (chef-client 19.3.15 correctly binlinked
-at `/usr/bin/chef-client`, `/opt/chef` legacy omnibus preserved). This confirms the three earlier
-404s were transient EC2-instance-side DNS/network flakiness reaching that endpoint during
-provisioning, not a cookbook or omnitruck-service bug — retry if this recurs.
+upstream migrate-ice/Go-runtime GC race (`fatal error: lfstack.push ... created by
+runtime.gcBgMarkStartWorkers`, exit code 2) that occurs under CPU-constrained/virtualized/emulated
+environments while extracting the ~160MB airgap tarball, regardless of flag values or
+`GOMAXPROCS`. The retry is the correct fix — do not attempt to fix this by altering
+fresh-install/preserve-omnibus logic or disabling GC tuning.
 
 ## Scheduler Resource Reconvergence (in-place, no process handoff, all platforms)
 
-After a successful install + binlink, the `install` resource re-runs any
+After a successful install + binlink, the `install` resource re-runs any already-declared
 `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task`
-resources already declared in the run_list's resource collection, explicitly setting their
-`chef_binary_path` property to the resolved, immutable, fully-versioned Habitat path
-(`ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path`, e.g.
-`/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client`) before re-running their
-already-declared `action`. No process handoff (re-exec or exit) of any kind is involved, on any
-platform.
+resources, explicitly setting their `chef_binary_path` to the resolved, fully-versioned Habitat path
+(`ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path`) before re-running their
+already-declared `action`. No process handoff (re-exec or exit) is involved, on any platform.
 
-**Do NOT point `chef_binary_path` at `chef_client_binlink_path` (the mutable `/usr/bin/chef-client`
-symlink)** — an earlier version of this fix did exactly that, reasoning it would "just work" across
-future upgrades since `hab pkg binlink --force` repoints that symlink automatically. That reasoning
-is true for pure idempotency/upgrade-tracking purposes, but it introduces a real local
-privilege-escalation window: `chef_client_cron`/`chef_client_systemd_timer`/`chef_client_launchd`/
-`chef_client_scheduled_task` all re-resolve their configured `chef_binary_path` fresh at every
-*scheduled* invocation (not just at chef-converge time), running as root/SYSTEM. A writable,
-well-known symlink sitting at that path is a standing target for the entire interval between
-chef-client runs — anyone able to repoint or replace `/usr/bin/chef-client` gets arbitrary
-root code execution on the next scheduled run, with no chef-client convergence involved at all.
-The fully-versioned Habitat path has no such window: it points directly at the immutable,
-Habitat-verified package payload, not a symlink indirection layer this cookbook itself maintains.
+**Do NOT point `chef_binary_path` at the mutable `/usr/bin/chef-client` binlink symlink.** The
+scheduler resources re-resolve `chef_binary_path` at every *scheduled* invocation (not just at
+converge time), running as root/SYSTEM — a writable, well-known symlink there is a standing local
+privilege-escalation target between chef-client runs. The fully-versioned Habitat path points
+directly at the immutable, Habitat-verified package payload instead.
 
-This does not reopen the "stale version after cleanup" problem that pointing at a versioned path
-might suggest: `reconverge_scheduler_resources` runs as part of *every* successful install/upgrade
-(see below), always re-pointing `chef_binary_path` at the newly installed version's resolved path
-**before** `chef_client_updater_enterprise_cleanup` ever runs — `install` and `cleanup` are declared
-as two separate resources in the run_list and Chef executes resources in declaration order, so by
-the time `cleanup` removes old Habitat versions, the schedule has already been repointed at the new
-one in the same converge. A schedule can only end up referencing a version `cleanup` later removes
-if `update_scheduler_resources` is disabled, or reconvergence is otherwise bypassed — the same
-responsibility boundary already documented on that property.
+This does not risk pointing at a version `cleanup` later removes: `install` and `cleanup` are
+separate resources and Chef executes resources in declaration order, so reconvergence always
+re-points `chef_binary_path` at the newly installed version **before** `cleanup` runs in the same
+converge. A schedule can only end up referencing a removed version if `update_scheduler_resources`
+is disabled or reconvergence is otherwise bypassed.
 
-**The fix must explicitly set `chef_binary_path` — it cannot rely on resetting or re-reading
-whatever default the resource would otherwise compute.** Confirmed via direct inspection of the
-actual chef-client gem bootstrapping the converge (whatever Test Kitchen/production installs as a
-starting point — e.g. the `stable` channel's 18.11.11): `chef_client_scheduled_task`'s
-`chef_binary_path` there is a plain, non-lazy, **hardcoded legacy path**
-(`"C:/#{LEGACY_CONF_DIR}/#{DIR_SUFFIX}/bin/#{CLIENT}"` — no `lazy {}` at all). Newer Chef Infra
-Client releases (e.g. whatever chef-ice itself ships, confirmed via `chef/chef`'s
-`lib/chef/resource/helpers/path_helpers.rb`) instead default `chef_binary_path` to a lazy,
-hab-aware `Chef::ResourceHelpers::PathHelpers.chef_client_hab_binary_path` block that resolves
-`File.realpath($PROGRAM_NAME)` — i.e., the *currently running* process's own resolved path. We
-deliberately do not rely on that upstream default either, even post-migration: it only produces the
-right answer when the process reading it is itself the Habitat-installed chef-client, which is not
-guaranteed for every caller/context in this cookbook's own reconvergence step, so
-`chef_client_hab_binary_path(pkg)` (this cookbook's own helper, in `libraries/helpers.rb`) resolves
-the same shape of path directly from the Habitat package store instead of relying on
-`$PROGRAM_NAME`. Since this cookbook's entire purpose is migrating *from* an unknown, potentially
-old bootstrap chef-client, we cannot assume the resource's own default is lazy or hab-aware at all —
-resetting a property (`Property#reset`) only forces a *default* to re-evaluate, and if that default
-is a hardcoded string, resetting changes nothing. Explicitly setting the property bypasses whatever
-default logic exists entirely, so it works identically regardless of the bootstrap Chef version's
-implementation.
+**The fix must explicitly SET `chef_binary_path` — resetting the property is not enough.** An
+older bootstrap chef-client's `chef_binary_path` default can be a plain, non-lazy, hardcoded legacy
+path (not a `lazy {}` block at all), so `Property#reset` (which only forces a *default* to
+re-evaluate) changes nothing. Even for a genuinely lazy default, `Property#get` only re-evaluates
+while the property remains unset — the first read caches the evaluated result. Explicitly setting
+the property bypasses whatever default logic exists, regardless of the bootstrap Chef version.
 
-**`chef_client_hab_binary_path` takes the resource's `version` property, not just `pkg`, and must
-resolve the PINNED version rather than always defaulting to `hab_pkg_dirs(pkg).last` (newest on
-disk).** Multiple `chef/chef-infra-client` versions can legitimately coexist under `/hab/pkgs`
-(see "Preserving Multiple Installed Versions" above), and a user explicitly pinning
-`chef_client_updater_enterprise_install`'s `version` property to an OLDER release — e.g. to work
-around a regression discovered in the latest one — is a supported, expected operation, not just an
-upgrade path. If reconvergence always resolved to `.last`, a user who intentionally rolled back to
-an older version would have their schedule silently repointed at a *newer* version still sitting on
-disk from an earlier run, undoing the rollback they just performed for the running chef-client
-process while leaving the schedule pointed at the version they were trying to avoid. `version:
-'latest'` (the resource's own default) still resolves to `hab_pkg_dirs(pkg).last`; any other
-explicit version string filters to that specific version/release pair instead.
+**`chef_client_hab_binary_path` takes the resource's `version` property, not just `pkg`, and
+resolves the PINNED version rather than always defaulting to `hab_pkg_dirs(pkg).last` (newest on
+disk).** Multiple `chef/chef-infra-client` versions can coexist under `/hab/pkgs`; a user
+explicitly pinning `version` to an older release (e.g. rolling back a regression) must not have
+their schedule silently repointed at a newer version still on disk. `version: 'latest'` (the
+default) resolves to `.last`; any explicit version string filters to that specific version/release.
 
+Declaration order relative to `chef_client_updater_enterprise_install` does not matter — Chef fully
+compiles the resource collection before convergence begins, so the scheduler resource is always
+already present when `reconverge_scheduler_resources` runs. **Gotcha**: inside a custom resource's
+`action_class`, `run_context` is a CHILD `RunContext` scoped to that action's own declarations —
+only `run_context.root_run_context.resource_collection` reaches the full, shared collection.
 
-Declaration order relative to `chef_client_updater_enterprise_install` does not matter: Chef fully
-compiles the resource collection for the entire run_list before convergence begins (`lib/chef/
-client.rb`'s Phase 2/Phase 3 separation), so the scheduler resource is always already present by
-the time our `reconverge_scheduler_resources` helper runs, regardless of where in the recipe it was
-declared. `test/cookbooks/.../recipes/scheduler_fix.rb` deliberately declares its scheduler resource
-*before* `chef_client_updater_enterprise_install` to prove this. **Gotcha**: `run_context` accessed
-from inside a custom resource's `action_class` is a CHILD `RunContext` scoped to that action's own
-nested declarations (empty of sibling recipe-level resources, even in `unified_mode`) — only
-`run_context.root_run_context.resource_collection` reaches the full, shared, recipe-level
-collection; `run_context.resource_collection` alone will find nothing.
+**History**: this replaced an earlier `Kernel.exec`/`exit(213)` process handoff, which deadlocked
+on Windows (MRI's `Kernel.exec` can't truly replace a process there, so the parent stays alive
+holding Chef's run-lock). In-place reconvergence avoids the run-lock entirely and needs no second
+chef-client run, on any platform.
 
-**History — why this replaced a Kernel.exec/exit(213) process handoff.** An earlier version of this
-resource actually re-executed chef-client (`Kernel.exec(handoff_bin, *ARGV)` on Linux/macOS) or
-exited with a Test Kitchen-recognized code (`exit(213)` on Windows, since Windows' `Kernel.exec`
-can't truly replace a process — MRI spawns-and-waits instead of using `execve()`, so the parent
-stays alive holding Chef's own run-lock, deadlocking the freshly spawned child against its own
-still-running parent; confirmed live via 45+ minute EC2 hangs). That entire mechanism is no longer
-needed, on any platform: reconverging the scheduler resource in-place solves the exact same problem
-without ever touching the run-lock, without depending on an orchestrator honoring Test Kitchen's
-`retry_on_exit_code: [35, 213]` convention (which real production systems have no equivalent of),
-and without a second chef-client run at all.
-
-**History — an earlier version of *this same reconvergence redesign* tried to avoid explicitly
-setting `chef_binary_path`,** reasoning that Chef's lazy property defaults are never memoized after
-the first read (true, per `Property#get`/`#stored_value_to_output` in `lib/chef/property.rb`) and
-that simply re-running the resource's action would be enough to let its own unmodified default
-re-evaluate. That reasoning was incomplete: `Property#get` only re-evaluates a lazy default on
-every read while the property remains *unset* on the resource instance; the very first read stores
-the *already-evaluated result* (not the lazy block) onto the resource, so every subsequent read
-before an explicit reset just returns that cached value — and, as established above, an older
-bootstrap chef-client's default may not even be lazy at all, in which case no amount of resetting
-helps. Confirmed live on Windows: `windows_task` reported `(up to date)` (no change) with the old
-approach even after explicitly calling `Property#reset`, and only started reporting
-`task updated` once `chef_binary_path` was explicitly set instead.
-
-The reconvergence `ruby_block` runs with `action :run` **unconditionally on every converge** (not
-gated behind a notification from the package-install step) — this was the second, previously
-undetected bug found via live Dokken testing of the `scheduler-fix` suite: an earlier version wired
-this via `notifies :run, ..., :immediately` from the platform-specific package-install resources
-(`rpm_package`/the `dpkg --configure` `execute`/`windows_package`/`package`) with the block itself
-declared `action :nothing`. Those install resources are properly idempotent and only report a
-change (thus only fire the notification) when chef-ice is actually installed/upgraded *in that
-converge*. That looked correct for the initial migration, but on any *later*, otherwise-unrelated
-converge — no chef-ice change, so no notification — the individually-declared
-`chef_client_cron`/`chef_client_systemd_timer`/etc. resources (with no explicit `chef_binary_path`
-in the calling recipe) still re-run their own previously-declared action every converge regardless,
-re-evaluating their own stale built-in default and silently reverting `chef_binary_path` back to
-the legacy omnibus path — with nothing left to correct it, since the notification that would fix it
-never fires again. Confirmed live: `scheduler-fix-almalinux-9`'s second (idempotency-check)
-converge flipped `/etc/cron.d/chef-client` and `/etc/systemd/system/chef-client.service` straight
-back from the correct `/usr/bin/chef-client` to `/opt/chef/bin/chef-client`, breaking both
-idempotency and the actual schedule.
-
-Running the `ruby_block` every converge instead means `reconverge_scheduler_resources` always
-re-asserts `resolved_binary_path` on the scheduler resources' `chef_binary_path`, so whether this
-run is "idempotent" is determined purely by whether the individual scheduler resources' own
-underlying templates/cron_d/systemd_unit/scheduled_task content already matches. `resolved_binary_path`
-(from `chef_client_hab_binary_path`) only changes when the package it actually resolves to changes:
-for the default `version: 'latest'` case that means a genuinely new chef-ice version was installed
-(it resolves to the newest installed version's directory); for an explicitly pinned `version` it
-stays fixed to that pinned version's directory regardless of what else gets installed (see
-"`chef_client_hab_binary_path` takes the resource's `version` property..." above). Either way, an
-otherwise-unrelated converge that changes neither the installed packages nor the pinned `version`
-can never see `resolved_binary_path` change, so this can never itself introduce a false "not
-idempotent" result. The individual
-`notifies :run, 'ruby_block[...]', :immediately` declarations on the package-install resources and
-on `chef_client_updater_enterprise_binlinks` have been removed entirely — they're now fully
-redundant (the block already runs every converge unconditionally) and kept the misleading
-appearance of being load-bearing.
+The reconvergence `ruby_block` runs with `action :run` **unconditionally on every converge**, not
+gated behind a notification from the package-install step. An earlier, notification-based design
+only fired when chef-ice was actually installed/upgraded *in that converge* — so on any later,
+otherwise-unrelated converge, the scheduler resources' own stale default silently reverted
+`chef_binary_path` back to the legacy omnibus path with nothing left to correct it. Running the
+block unconditionally means idempotency is determined purely by whether the scheduler resources'
+own underlying content already matches; `resolved_binary_path` only changes when the package it
+resolves to changes (a new install for `version: 'latest'`, or never for an explicitly pinned
+version), so this can never itself introduce a false "not idempotent" result.
 
 ## Cleanup Removal Uses Direct `hab pkg uninstall`, Not `habitat_package`
 
 `chef_client_updater_enterprise_cleanup` removes old Habitat versions via a plain `execute`
-resource (`hab pkg uninstall <origin>/<name>/<version>/<release>`, the full ident), not Chef's
-built-in `habitat_package` resource. This is a deliberate workaround for a Chef-core idempotency
-blind spot, not a style preference — do not "simplify" it back without re-verifying the failure
-mode below on a live multi-version Kitchen suite.
+(`hab pkg uninstall <origin>/<name>/<version>/<release>`, the full ident), not Chef's built-in
+`habitat_package` resource. Do not "simplify" this back without re-verifying on a live
+multi-version Kitchen suite.
 
-**The bug this works around:** `Chef::Provider::Package::Habitat#installed_version` (part of Chef
-core, `lib/chef/provider/package/habitat.rb`) determines whether a version is "installed" by
-running `hab pkg path <bare origin/name>` — with no version qualifier — and comparing whatever
-that resolves to against `new_resource.version`. `hab pkg path` on a bare origin/name resolves
-Habitat's own notion of the *current/active* package for that name, not "does this specific
-version still exist on disk." When multiple `chef/chef-infra-client` versions legitimately coexist
-(the entire reason this cookbook's multi-version support exists), that check can report an older,
-still-present version as "not installed," so `habitat_package ... action :remove` silently no-ops
-instead of removing it — confirmed live via a fresh Dokken `multi-version-almalinux-9` converge:
-after installing 19.2.12 then 19.3.15 with `keep_versions 1`, `cleanup` logged
-`habitat_package[chef/chef-infra-client] action remove (up to date)` and both versions remained on
-disk (`hab pkg list chef/chef-infra-client` still showed both idents).
+**The bug this works around:** `Chef::Provider::Package::Habitat#installed_version` determines
+"installed" by running `hab pkg path <bare origin/name>` (no version qualifier) — Habitat's notion
+of the *current/active* package, not "does this specific version exist on disk." When multiple
+`chef/chef-infra-client` versions coexist, this can report an older, still-present version as "not
+installed," so `habitat_package action :remove` silently no-ops instead of removing it.
 
-**The fix:** drive `hab pkg uninstall` directly against the full ident
-(`origin/name/version/release`), bypassing `habitat_package`'s idempotency check entirely. Each
-`execute` resource is named uniquely per ident (`execute["remove Habitat package
-<full-ident>"]`) and carries its own `only_if { File.directory?(...) }` guard, checked directly
-against the actual Habitat package directory for that specific version/release — not against
-`hab`'s own "current" resolution. `HAB_LICENSE=accept-no-persist` is supplied via `environment`
-(same convention as `hab_env` elsewhere in this cookbook) so the command never blocks on an
-interactive license prompt. The Habitat ident backing the currently-running `chef-client` process
-is still excluded from `to_remove` before any `execute` resources are even declared (unchanged from
-before this fix — see `running_hab_ident` usage in `resources/cleanup.rb`).
+**The fix:** drive `hab pkg uninstall` directly against the full ident, bypassing
+`habitat_package`'s idempotency check. Each `execute` is named uniquely per ident and guarded with
+`only_if { File.directory?(...) }` against the actual package directory for that version/release.
+`HAB_LICENSE=accept-no-persist` is supplied via `environment` to avoid an interactive license
+prompt. The Habitat ident backing the currently-running `chef-client` process is excluded from
+`to_remove` before any `execute` resources are declared (`running_hab_ident` in
+`resources/cleanup.rb`).
 
-Both `hab_binary` and the full `ident` are shell-escaped (`Shellwords#shellescape`) before being
-interpolated into the `execute` resource's `command` string — `new_resource.habitat_package` is a
-user-configurable `String` property with no format validation, so it cannot be treated as
-inherently shell-safe.
+Both `hab_binary` and the full `ident` are shell-escaped (`Shellwords#shellescape`) before
+interpolation into the `command` string — `new_resource.habitat_package` is a user-configurable
+`String` with no format validation.
 
-Unit test coverage (`spec/unit/resources/cleanup_spec.rb`) asserts against the declared
-`execute["remove Habitat package <full-ident>"]` resources and their `command` content directly,
-not a ChefSpec package-resource matcher — see the "Unit Testing (ChefSpec/RSpec)" section above.
+`spec/unit/resources/cleanup_spec.rb` asserts against the declared `execute["remove Habitat
+package <full-ident>"]` resources and their `command` content directly, not a ChefSpec
+package-resource matcher.
 
 ## Chef Core Idempotency-Reporting Bugs to Watch For (Windows)
 
-Two Chef-core built-in resources were found, live on EC2 `windows-2022`, to misreport idempotency
-in ways that made this cookbook's own resources look "not idempotent" on converge2 even though
-nothing had actually changed:
+Two Chef-core built-in resources misreport idempotency on converge #2 even when nothing changed:
 
-- **`windows_env` create/delete pairs have zero built-in idempotency of their own** — `:create`
-  unconditionally rewrites the variable and `:delete` unconditionally removes it, every converge,
-  regardless of current state. The `CHEF_LICENSE_KEY` env-var pair (used only transiently, to pass
-  the license into chef-ice's MSI `PostInstall.ps1`) in `resources/install.rb` is guarded with a
-  `msi_already_current = pkg_version && installed_version == pkg_version` local and `not_if {
-  msi_already_current }` on both the `:create` and `:delete` resources. Any future one-shot
-  `windows_env` bracketing an idempotent operation needs the same kind of explicit guard.
-- **`Chef::Resource::WindowsPath`'s `:add` action never propagates its inner sub-resource's
-  "no change" status.** It wraps a nested `env "path" { action :modify }` internally
-  (`lib/chef/resource/windows_path.rb`, part of Chef core) — confirmed live via logs showing
-  `windows_env[path] action modify (up to date)` nested directly under `windows_path[C:\hab\bin]
-  action add`, while the OUTER `windows_path` resource still counted as "updated" toward the
-  converge's resource-update total. `resources/binlinks.rb`'s `windows_path 'C:\hab\bin'` resource
-  works around this with an explicit `not_if` block that reads the live Machine `PATH` via
-  `Win32::Registry` (falling back to `ENV['PATH']`) and checks case-insensitively whether
-  `C:\hab\bin` is already present.
+- **`windows_env` create/delete have no built-in idempotency** — both actions unconditionally
+  rewrite/remove every converge. The transient `CHEF_LICENSE_KEY` env-var pair in
+  `resources/install.rb` is guarded with `not_if { msi_already_current }` on both actions. Any
+  future one-shot `windows_env` bracketing an idempotent operation needs the same guard.
+- **`windows_path`'s `:add` action never propagates its inner `env` sub-resource's "no change"
+  status** — the outer resource still counts as "updated" even when the nested `env "path"` is
+  `(up to date)`. `resources/binlinks.rb`'s `windows_path 'C:\hab\bin'` works around this with an
+  explicit `not_if` that reads the live Machine `PATH` (via `Win32::Registry`, falling back to
+  `ENV['PATH']`) and checks case-insensitively for `C:\hab\bin`.
 
-**General pattern**: any Chef-core built-in resource that internally declares its own nested
-sub-resources should be treated with suspicion for idempotency-reporting correctness on
-converge-twice checks, and independently guarded with `not_if`/`only_if` against the actual
-desired end-state rather than trusted to self-report "no change" correctly.
+**General pattern**: treat any Chef-core resource with internally-nested sub-resources as suspect
+for idempotency-reporting on converge-twice checks, and guard independently with `not_if`/`only_if`.
 
-Without reconvergence (`update_scheduler_resources false`), a scheduler resource declared while
-chef-ice isn't yet binlinked bakes a stale/fallback path into its cron_d/plist/systemd-unit/
-scheduled-task permanently, since nothing else would ever cause it to re-evaluate. One additional
-concrete consequence to be aware of regardless of this setting:
-
-`chef_client_updater_enterprise_cleanup` always excludes `running_hab_ident` from removal (see
-`resources/cleanup.rb`), but "running" can mean a version several releases behind the newest
-installed one. Once that lagging version is no longer "running", cleanup treats it as just
-another old version and removes it — breaking any schedule that still references it.
+**Without reconvergence** (`update_scheduler_resources false`), a scheduler resource declared
+before chef-ice is binlinked bakes a stale path in permanently. Separately, `cleanup` only excludes
+the currently-*running* Habitat ident from removal — once a lagging pinned version is no longer
+"running," cleanup removes it like any other old version, breaking any schedule still pointing at
+it.
 
 ## Binlinks
 
-`hab pkg binlink` creates symlinks for all package binaries. On Linux and macOS these land in
-`/usr/bin/`. On Windows they become `.bat` shims in `C:\hab\bin\`, and the resource adds that
-directory to the system PATH via `windows_path`.
+`hab pkg binlink` creates symlinks for all package binaries: `/usr/bin/` on Linux/macOS, `.bat`
+shims in `C:\hab\bin\` on Windows (added to system PATH via `windows_path`).
 
-The `:remove` action on the binlinks resource is a no-op that logs a warning. Habitat does not
-provide a bulk unbinlink command. Manual symlink cleanup is required if binlinks need to be removed.
+The `:remove` action is a no-op that logs a warning — Habitat has no bulk unbinlink command; manual
+symlink cleanup is required.
 
-The `:create` action's `execute` resource MUST be idempotent on every platform — it is otherwise
-harmless if it reports a change on every converge, since (per the "Scheduler Resource
-Reconvergence" section above) the reconvergence `ruby_block` now runs unconditionally every
-converge and no longer depends on any notification from `binlinks`. It remains idempotent
-regardless: `migrate-ice apply airgap` already creates the
-binlink as a side effect of install, so this resource's own `not_if` (`binlink_current?`/
-`binlink_current_windows?`) is satisfied immediately and it never actually re-runs `hab pkg
-binlink` in practice. On Linux/macOS,
-idempotency uses `File.symlink?`/`File.readlink`. On Windows, binlinks are generated `.bat` shim
-files rather than true symlinks (`File.symlink?` is always false), so idempotency instead checks
-whether the shim's script content already references the resolved package's install path
-(`binlink_current_windows?` in `resources/binlinks.rb`). Do not remove either `not_if` guard.
-
-## migrate-ice: `--fresh-install` is now conditional (see section above), not unconditional
-
-**This section previously documented "always pass `--fresh-install`" — that guidance was wrong and
-has been superseded by the "`migrate-ice apply airgap`'s `--fresh-install` Flag Is Conditional, Not
-Unconditional" section above.** Kept here (condensed) only to explain what changed and why, since
-the original reasoning below was based on incomplete testing at the time (Dokken-only, never
-confirmed against a live EC2/native-VM run where `chef-client` really is on `$PATH`).
-
-The original reasoning: `migrate-ice`'s non-fresh-install path decides whether an existing Chef
-Client installation exists by shelling out to `chef-client -v` via `$PATH`
-(`IsChefClientInstalled` in `lib/chef_package/chef_client_install.go`, part of
-`chef/migration-tools`, the private source-available repo for the `migrate-ice` binary). On Dokken,
-where `chef-client` is invoked by full path and never added to `$PATH`, that check returns false,
-so the non-fresh path just no-ops harmlessly — meaning `--fresh-install` really was required there.
-
-**What was missed:** on EC2/native VMs, `chef-client` genuinely IS on `$PATH` (native package
-installs put it there), so the non-fresh-install path's `IsChefClientInstalled` check succeeds and
-the migration proceeds *correctly*, extracting the bundle and fully respecting
-`--preserve-omnibus true` by gracefully skipping fstab handling when `/opt/chef` isn't its own
-mount (logged as `/opt/chef is not mounted. Skipping --fstab flag handling.`) — confirmed live via
-direct manual invocation on a real EC2 instance. The mount-remount failure this section originally
-warned about is real but only triggers when `/opt/chef` genuinely is a dedicated mount, which is a
-supported-but-uncommon customer configuration, not the default case this section implied.
-
-Passing `--fresh-install` unconditionally instead causes the OPPOSITE problem on EC2/native VMs:
-migrate-ice's fresh-install path detects `chef-client` IS installed (it checks this internally too)
-and refuses to run at all — logging "chef-client has been detected on the system... run the tool
-without the --fresh-install flag" and exiting 0 without extracting anything. `/hab/pkgs` is left
-permanently empty, and `execute[migrate-ice apply airgap]`'s own `not_if` guard can never be
-satisfied, so it looks like a never-idempotent resource re-running every converge — this is exactly
-the `preserve-omnibus` EC2 `NOT_IDEMPOTENT` bug that led to root-causing this whole issue. See the
-section above for the actual current (correct) behavior: `chef_client_on_path?` decides the flag.
+The `:create` action's `execute` MUST stay idempotent on every platform: `migrate-ice apply airgap`
+already creates the binlink as a side effect of install, so `binlink_current?`/
+`binlink_current_windows?` (the resource's `not_if`) is satisfied immediately and `hab pkg binlink`
+never actually re-runs in practice. Linux/macOS check via `File.symlink?`/`File.readlink`; Windows
+binlinks are generated `.bat` shims (not true symlinks, so `File.symlink?` is always false) and
+instead check whether the shim's content already references the resolved install path
+(`binlink_current_windows?`). Do not remove either `not_if` guard.
 
 ## Local Dokken CI Testing (Apple Silicon / general)
 
-`kitchen.dokken.yml`'s `provisioner.clean_dokken_sandbox: false` is a **required, permanent**
-setting, not a testing convenience. kitchen-dokken's provisioner (`clean_dokken_sandbox` defaults to
-`true` upstream) deletes the entire bind-mounted `/opt/kitchen` sandbox directory (which backs
-`Chef::Config[:file_cache_path]`) after **every single converge**. Any resource whose idempotency
-depends on that cache dir persisting across separate `kitchen converge` invocations — here,
-`cookbook_file[mixlib-install.gem]` and `remote_file[chef-ice-*.rpm/.deb/.msi]` — can never be
-idempotent under the default setting, on real GitHub Actions x86_64 runners just as much as locally.
-This was the root cause of the CI "idempotency check" step failing; it is not a bug in
-`cookbook_file`/`remote_file`, which were correctly detecting the (actually-absent, post-wipe)
-on-disk state each time.
+`kitchen.dokken.yml`'s `provisioner.clean_dokken_sandbox: false` is **required, permanent** —
+kitchen-dokken defaults to wiping the bind-mounted `/opt/kitchen` sandbox (backing
+`Chef::Config[:file_cache_path]`) after every converge, which breaks idempotency for
+`cookbook_file[mixlib-install.gem]`/`remote_file[chef-ice-*]` on both local and GitHub Actions
+runners.
 
-To test Dokken suites locally on Apple Silicon (arm64 host), kitchen-dokken's driver `platform`
-config option must be used to force the container architecture — setting the `DOCKER_DEFAULT_PLATFORM`
-environment variable does **not** work, because kitchen-dokken creates containers via the
-`docker-api` Ruby gem (raw Docker socket API calls), not the `docker` CLI, and that env var is only
-honored by the CLI. Temporarily add to `kitchen.dokken.yml`'s `driver:` block:
+To test Dokken suites locally on Apple Silicon, force the container architecture via
+kitchen-dokken's driver `platform` option — `DOCKER_DEFAULT_PLATFORM` does NOT work (kitchen-dokken
+uses the `docker-api` gem's raw socket calls, not the `docker` CLI, which is the only thing that
+honors that env var). Temporarily add to `kitchen.dokken.yml`'s `driver:` block:
 
 ```yaml
 driver:
   platform: linux/amd64
 ```
 
-and revert it before committing — real GitHub Actions Linux runners are already native x86_64, so
-this line is a local-only testing aid, never a permanent fix like `clean_dokken_sandbox: false`
-above. `kitchen.local.yml` is normally auto-merged by Test Kitchen for exactly this kind of local
-override, but this repo's workflow and local testing both set `KITCHEN_LOCAL_YAML=kitchen.dokken.yml`
-explicitly, which replaces that lookup entirely — so temporary edits must go directly into
-`kitchen.dokken.yml` since there is no other local-override mechanism available given that env var
-usage.
+Revert before committing — GitHub Actions Linux runners are already native x86_64. Since this repo
+sets `KITCHEN_LOCAL_YAML=kitchen.dokken.yml` explicitly (bypassing Test Kitchen's usual
+`kitchen.local.yml` auto-merge), temporary edits must go directly into `kitchen.dokken.yml`.
 
-`CHEF_LICENSE_KEY` is stored as a public GitHub Actions repository **variable** (not secret) on this
-repo, retrievable for local reproduction via
-`gh variable get CHEF_LICENSE_KEY --repo <owner>/<repo>` — no need to ask for a secret to test
-locally.
+`CHEF_LICENSE_KEY` is a public GitHub Actions repository **variable** (not secret) — retrieve it
+for local reproduction via `gh variable get CHEF_LICENSE_KEY --repo <owner>/<repo>`.

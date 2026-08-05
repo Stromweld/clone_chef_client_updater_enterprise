@@ -25,10 +25,10 @@ ALL_CUSTOM_RESOURCES = %w[
 # its custom resources. spec/fixtures/cookbooks/chefspec_shim `depends` on
 # this cookbook, purely so converging its empty default recipe pulls
 # chef_client_updater_enterprise's resources/*.rb into cookbook_order without
-# executing any real resource actions. `testing/`, this cookbook's real
-# parent directory, is deliberately NOT used as cookbook_path: it also
-# contains a `clone_chef_client_updater_enterprise` sibling with the same
-# cookbook name, which Chef's CookbookLoader refuses to merge. Instead,
+# executing any real resource actions. This cookbook's real parent directory
+# is deliberately NOT used as cookbook_path: another checkout of this
+# cookbook (declaring the same name in its own metadata.rb) may exist
+# alongside it, which Chef's CookbookLoader refuses to merge. Instead,
 # spec/fixtures/cookbooks/chef_client_updater_enterprise/{metadata.rb,
 # resources,libraries} are individual per-file symlinks back to this
 # cookbook's real files — Dir.glob (used by Chef's cookbook loader) does not
