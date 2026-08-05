@@ -260,4 +260,78 @@ describe ChefClientUpdaterEnterprise::Helpers do
       expect(host.running_hab_ident).to eq('chef/chef-infra-client/19.3.15/20260601120000')
     end
   end
+
+  # Regression coverage for the Windows "'msiexec' is not recognized as an
+  # internal or external command" failure (see resources/install.rb's windows?
+  # branch): accounts that have never interactively logged on — CI's
+  # `net user /add` test user driven over WinRM being the canonical case — can
+  # expose a PATH containing literal `%SystemRoot%` tokens, or one missing the
+  # Windows system directories entirely. Mixlib::ShellOut does a literal
+  # PATH-directory search with no `%` expansion, so both break every bare-name
+  # OS executable, msiexec included.
+  describe '#repair_windows_path!' do
+    let(:system_dirs) do
+      [
+        'C:\Windows\System32',
+        'C:\Windows',
+        'C:\Windows\System32\Wbem',
+        'C:\Windows\System32\WindowsPowerShell\v1.0',
+      ]
+    end
+
+    around do |example|
+      original_path = ENV.fetch('PATH', nil)
+      original_system_root = ENV.fetch('SystemRoot', nil)
+      ENV['SystemRoot'] = 'C:\Windows'
+      example.run
+    ensure
+      ENV['PATH'] = original_path
+      if original_system_root.nil?
+        ENV.delete('SystemRoot')
+      else
+        ENV['SystemRoot'] = original_system_root
+      end
+    end
+
+    before { host.fake_windows = true }
+
+    it 'expands literal %VAR% tokens' do
+      ENV['PATH'] = 'C:\Users\test\bin;%SystemRoot%\System32'
+      host.repair_windows_path!
+
+      expect(ENV.fetch('PATH')).to start_with('C:\Users\test\bin;C:\Windows\System32')
+      expect(ENV.fetch('PATH')).not_to include('%')
+    end
+
+    it 'appends the system directories when PATH omits them entirely' do
+      ENV['PATH'] = 'C:\Users\test\bin'
+      host.repair_windows_path!
+
+      expect(ENV.fetch('PATH').split(';')).to eq(['C:\Users\test\bin'] + system_dirs)
+    end
+
+    it 'is a no-op when the system directories are already present in any casing' do
+      already = 'c:\windows\system32;C:\Windows;C:\Windows\System32\Wbem;' \
+                'C:\Windows\System32\WindowsPowerShell\v1.0'
+      ENV['PATH'] = already
+      host.repair_windows_path!
+
+      expect(ENV.fetch('PATH')).to eq(already)
+    end
+
+    it 'never emits an empty PATH entry when PATH starts out empty' do
+      ENV['PATH'] = ''
+      host.repair_windows_path!
+
+      expect(ENV.fetch('PATH').split(';')).to eq(system_dirs)
+    end
+
+    it 'leaves PATH untouched on non-Windows platforms' do
+      host.fake_windows = false
+      ENV['PATH'] = '/usr/bin:/bin'
+      host.repair_windows_path!
+
+      expect(ENV.fetch('PATH')).to eq('/usr/bin:/bin')
+    end
+  end
 end

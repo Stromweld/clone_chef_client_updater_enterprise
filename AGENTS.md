@@ -175,6 +175,18 @@ through a shell, so the wrapper is a no-op there but required for Dokken. The ho
 `/opt/kitchen/client.rb` (Dokken sandbox root) and falls back to `/tmp/kitchen` (Vagrant), since
 both drivers share this one `kitchen.yml`.
 
+**That hook must stay declared INSIDE the `remove-omnibus` suite, never at `kitchen.yml`'s top
+level.** Test Kitchen's lifecycle-hook `includes`/`excludes` filters match on PLATFORM name only
+(`Kitchen::LifecycleHook::Base#should_run?`), so a top-level hook cannot be skipped per suite — it
+re-runs the whole recipe for every suite. That is fatal for `multi-version`, whose recipe is
+deliberately non-idempotent (install old version, install new version, then `cleanup` removes the
+old Habitat version): the second pass sees the older version missing, tries to reinstall it over
+the newer one, and kills the chef-client process executing out of it (`Docker Exec (135)`).
+The hook's platform filters must also list every Windows platform name in use across all kitchen
+configs (`windows-2022`/`windows-11` in `kitchen.yml`, `windows-latest`/`localhost` in
+`kitchen.proxy.yml`) — a Windows platform missing from the `excludes` list gets the Linux
+`sh -c` variant.
+
 **`remove-omnibus` is excluded from the CI idempotency check's second top-level `kitchen
 converge`** — `kitchen-dokken` hardcodes `chef_binary: "/opt/chef/bin/chef-client"` for every
 top-level converge, but this suite deletes `/opt/chef` by the end of the first one, so a second
@@ -379,6 +391,21 @@ interpolation into the `command` string — `new_resource.habitat_package` is a 
 `spec/unit/resources/cleanup_spec.rb` asserts against the declared `execute["remove Habitat
 package <full-ident>"]` resources and their `command` content directly, not a ChefSpec
 package-resource matcher.
+
+## Windows PATH Repair Before `msiexec`
+
+`resources/install.rb`'s Windows branch calls `repair_windows_path!` (`libraries/helpers.rb`)
+immediately before the `windows_package` resource. Windows accounts that have never interactively
+logged on — CI's `net user /add` test user driven over WinRM being the canonical case — can expose
+a `PATH` that either contains literal, unexpanded `%SystemRoot%`-style tokens (inherited from the
+default user profile template) or omits the Windows system directories entirely. `Mixlib::ShellOut`
+does a literal PATH-directory search with no `%` expansion, so both break every bare-name OS
+executable and the MSI install dies with `'msiexec' is not recognized as an internal or external
+command` even though `msiexec.exe` is present on disk (this failed EVERY Windows suite, not just
+one). The helper therefore does both: expands `%VAR%` tokens AND appends any missing
+System32/Windows/Wbem/WindowsPowerShell directories (case-insensitively deduplicated). Expansion
+alone is not sufficient — it can only repair entries that are actually present. Covered by
+`spec/unit/libraries/helpers_spec.rb`.
 
 ## Chef Core Idempotency-Reporting Bugs to Watch For (Windows)
 

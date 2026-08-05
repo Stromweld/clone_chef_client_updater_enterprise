@@ -279,6 +279,48 @@ module ChefClientUpdaterEnterprise
       path_dirs.any? { |dir| ::File.executable?(::File.join(dir, exe)) }
     end
 
+    # Repairs the current process's PATH on Windows so that plain executable
+    # names shipped with the OS (notably `msiexec`) resolve.
+    #
+    # Two independent breakages are handled, both seen on accounts that have
+    # never interactively logged on (CI's `net user /add` test user driven
+    # over WinRM is the canonical case):
+    #
+    #   1. Literal, unexpanded `%SystemRoot%`-style tokens inherited from the
+    #      default user profile template. Mixlib::ShellOut does a literal
+    #      directory search with no `%` expansion, so those entries resolve to
+    #      nothing.
+    #   2. A PATH that omits the Windows system directories entirely, which
+    #      expansion alone obviously cannot fix.
+    #
+    # Both surface identically as "'msiexec' is not recognized as an internal
+    # or external command" even though msiexec.exe is present on disk. No-op
+    # on non-Windows.
+    def repair_windows_path!
+      return unless windows?
+
+      path = ENV['PATH'].to_s
+      path = path.gsub(/%([^%]+)%/) { ENV[Regexp.last_match(1)] || Regexp.last_match(0) } if path.include?('%')
+
+      # Hardcoded rather than ::File::PATH_SEPARATOR: this branch only ever runs
+      # on Windows, where the separator is always ';' regardless of what the Ruby
+      # interpreter running the spec suite reports.
+      sep = ';'
+      system_root = ENV['SystemRoot'] || ENV['windir'] || 'C:\\Windows'
+      system32 = ::File.join(system_root, 'System32').tr('/', '\\')
+      required = [
+        system32,
+        system_root.tr('/', '\\'),
+        ::File.join(system32, 'Wbem').tr('/', '\\'),
+        ::File.join(system32, 'WindowsPowerShell', 'v1.0').tr('/', '\\'),
+      ]
+
+      existing = path.split(sep).map { |d| d.tr('/', '\\').chomp('\\').downcase }
+      missing = required.reject { |d| existing.include?(d.chomp('\\').downcase) }
+
+      ENV['PATH'] = ([path] + missing).reject(&:empty?).join(sep)
+    end
+
     # Returns true if `path` is itself a filesystem mount point (e.g. a dedicated
     # block device mounted at /opt/chef, which some users use to keep the
     # omnibus install isolated from the root drive image). Compares the device

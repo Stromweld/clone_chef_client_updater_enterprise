@@ -454,16 +454,18 @@ action :install do
     # user, or any account that has never interactively logged on) can
     # inherit a PATH containing literal, unexpanded `%SystemRoot%`-style
     # tokens from the default user profile template instead of resolved
-    # paths. Mixlib::ShellOut on Windows does a literal PATH-directory search
-    # with no shell-style `%` expansion, so an entry like
-    # `%SystemRoot%\system32` never resolves to `C:\Windows\system32` and the
-    # `package` resource's `msiexec` invocation below fails with `'msiexec'
+    # paths — or, over WinRM, a PATH that omits the Windows system
+    # directories entirely. Mixlib::ShellOut on Windows does a literal
+    # PATH-directory search with no shell-style `%` expansion, so an entry
+    # like `%SystemRoot%\system32` never resolves to `C:\Windows\system32`,
+    # and a PATH missing that directory outright fails the same way: the
+    # `package` resource's `msiexec` invocation below dies with `'msiexec'
     # is not recognized as an internal or external command` even though
-    # msiexec.exe is right there on disk. Expand any `%VAR%` tokens against the current
-    # process environment before that resource runs.
-    if ::ENV['PATH'].to_s.include?('%')
-      ::ENV['PATH'] = ::ENV['PATH'].gsub(/%([^%]+)%/) { ::ENV[Regexp.last_match(1)] || Regexp.last_match(0) }
-    end
+    # msiexec.exe is right there on disk. Expand any `%VAR%` tokens AND
+    # guarantee the core system directories are present before that resource
+    # runs. Expansion alone is not sufficient — it can only fix entries that
+    # are actually there.
+    repair_windows_path!
 
     msi_already_current = pkg_version && installed_version == pkg_version
 

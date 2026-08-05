@@ -32,23 +32,6 @@ platforms:
       customize:
         memory: 4096
 
-# remove_omnibus defers deletion while still running under the legacy omnibus
-# chef-client (see resources/remove_omnibus.rb); this hook performs the
-# genuinely separate second chef-client run needed to complete the removal,
-# invoking the cookbook's own stable binlink directly so it never resolves
-# back to the omnibus binary. See AGENTS.md "Omnibus Removal" for the full
-# rationale.
-lifecycle:
-  post_converge:
-    - remote: |
-        sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
-      excludes:
-        - windows-2022
-    - remote: |
-        C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
-      includes:
-        - windows-2022
-
 suites:
   - name: default
     verifier:
@@ -68,6 +51,37 @@ suites:
   - name: remove-omnibus
     provisioner:
       named_run_list: remove_omnibus
+    # remove_omnibus defers deletion while still running under the legacy
+    # omnibus chef-client (see resources/remove_omnibus.rb); this hook performs
+    # the genuinely separate second chef-client run needed to complete the
+    # removal, invoking the cookbook's own stable binlink directly so it never
+    # resolves back to the omnibus binary. See AGENTS.md "Omnibus Removal" for
+    # the full rationale.
+    #
+    # It MUST stay scoped to this one suite rather than living at the top level.
+    # Test Kitchen's own lifecycle-hook `includes`/`excludes` filters match on
+    # PLATFORM name only (Kitchen::LifecycleHook::Base#should_run?), so there is
+    # no way to skip a suite from a global hook. A global hook re-runs the whole
+    # recipe for every suite, which is fatal for multi-version: that recipe is
+    # deliberately non-idempotent (install old, install new, then cleanup removes
+    # the old Habitat version), so a second run tries to reinstall the older
+    # chef-ice over the newer one and kills the chef-client executing from it.
+    lifecycle:
+      post_converge:
+        - remote: |
+            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
+          excludes:
+            - windows-2022
+            - windows-11
+            - windows-latest
+            - localhost
+        - remote: |
+            C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
+          includes:
+            - windows-2022
+            - windows-11
+            - windows-latest
+            - localhost
     verifier:
       inspec_tests:
         - test/integration/remove-omnibus
