@@ -32,6 +32,10 @@ Set the `CHEF_LICENSE_KEY` environment variable on your nodes, then use the inst
 chef_client_updater_enterprise_install 'default'
 ```
 
+`CHEF_LICENSE_KEY` must be exported wherever the converge actually runs `migrate-ice` (Test Kitchen
+drivers, CI runners, production nodes) — the `install` resource's `license_key` property defaults
+to reading it from the environment, and `migrate-ice apply airgap` fails without a valid key.
+
 This downloads the latest stable `chef-ice` package, installs it via the native package manager (rpm/deb/msi, preserving any previously installed `chef-ice` version and the legacy omnibus install), creates Habitat binlinks, and re-execs the running `chef-client` process under the new binary. To also clean up old versions and remove a legacy omnibus installation:
 
 ```ruby

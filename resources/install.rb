@@ -285,6 +285,7 @@ action :install do
     installed = current_installed_version(new_resource.product_name, new_resource.habitat_package)
     if installed == new_resource.version
       Chef::Log.debug("chef_client_updater_enterprise_install: #{new_resource.product_name} #{new_resource.version} already installed, skipping.")
+      reconverge_installed_scheduler_resources(new_resource)
       return
     end
   end

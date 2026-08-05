@@ -13,6 +13,8 @@ describe command('chef-client --version') do
 end
 
 if os.linux?
+  older_chef_ice_version = '19.2.12'
+
   # The third install in this suite's recipe is unpinned ('latest'), so the
   # actually-retained version drifts as Habitat's depot publishes newer
   # chef-infra-client releases — do not hardcode it. Discover it dynamically
@@ -43,7 +45,7 @@ if os.linux?
     it { should be_directory }
   end if retained_version
 
-  describe file("/hab/pkgs/chef/chef-infra-client/#{older_version}") do
+  describe file("/hab/pkgs/chef/chef-infra-client/#{older_chef_ice_version}") do
     it { should_not exist }
   end
 end

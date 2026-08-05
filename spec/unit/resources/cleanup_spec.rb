@@ -24,14 +24,17 @@ describe 'chef_client_updater_enterprise_cleanup' do
     allow(Gem).to receive(:loaded_specs).and_return('chef' => chef_spec)
   end
 
-  # ChefSpec's remove_habitat_package(name).with(version: ...) matcher looks up
-  # a resource by (type, name) only, so with several habitat_package resources
-  # sharing the same name (only `version` differs), it can only ever see the
-  # last one declared. Inspect every declared :remove resource by version instead.
-  def removed_habitat_versions(chef_run, name)
+  # cleanup.rb drives removal via a plain `execute` resource (not the built-in
+  # `habitat_package`, whose own idempotency check cannot distinguish a specific
+  # non-latest installed version — see the comment in cleanup.rb for why). Several
+  # `execute["remove Habitat package ..."]` resources share the same resource type
+  # but differ by name (the full ident is baked into the resource name itself),
+  # so — unlike the old habitat_package-based test — a plain type/name matcher
+  # is inherently unambiguous per ident already. Collect the full set for clarity.
+  def removed_idents(chef_run)
     chef_run.resource_collection.all_resources.select do |r|
-      r.resource_name == :habitat_package && r.name == name && r.performed_action?(:remove)
-    end.map(&:version)
+      r.resource_name == :execute && r.name.start_with?('remove Habitat package ')
+    end.map { |r| r.name.delete_prefix('remove Habitat package ') }
   end
 
   context 'fewer installed versions than keep_versions' do
@@ -47,7 +50,7 @@ describe 'chef_client_updater_enterprise_cleanup' do
     end
 
     it 'removes nothing' do
-      expect(chef_run).to_not remove_habitat_package('chef/chef-infra-client')
+      expect(removed_idents(chef_run)).to be_empty
     end
   end
 
@@ -63,12 +66,22 @@ describe 'chef_client_updater_enterprise_cleanup' do
       end
     end
 
-    it 'removes every version older than the retained count' do
-      expect(removed_habitat_versions(chef_run, 'chef/chef-infra-client')).to contain_exactly('19.1.0', '19.2.0')
+    it 'removes every version older than the retained count, by full ident' do
+      expect(removed_idents(chef_run)).to contain_exactly(
+        'chef/chef-infra-client/19.1.0/20260101090000',
+        'chef/chef-infra-client/19.2.0/20260201090000'
+      )
     end
 
     it 'keeps the newest version' do
-      expect(removed_habitat_versions(chef_run, 'chef/chef-infra-client')).to_not include('19.3.0')
+      expect(removed_idents(chef_run)).to_not include('chef/chef-infra-client/19.3.0/20260301090000')
+    end
+
+    it 'each removal execute resource actually targets the full ident, not just the version' do
+      removal = chef_run.resource_collection.all_resources.find do |r|
+        r.resource_name == :execute && r.name == 'remove Habitat package chef/chef-infra-client/19.1.0/20260101090000'
+      end
+      expect(removal.command).to include('chef/chef-infra-client/19.1.0/20260101090000')
     end
   end
 
@@ -86,11 +99,11 @@ describe 'chef_client_updater_enterprise_cleanup' do
     end
 
     it 'never removes the version the currently running process was loaded from' do
-      expect(removed_habitat_versions(chef_run, 'chef/chef-infra-client')).to_not include('19.1.0')
+      expect(removed_idents(chef_run)).to_not include('chef/chef-infra-client/19.1.0/20260101090000')
     end
 
     it 'still removes other old versions' do
-      expect(removed_habitat_versions(chef_run, 'chef/chef-infra-client')).to include('19.2.0')
+      expect(removed_idents(chef_run)).to include('chef/chef-infra-client/19.2.0/20260201090000')
     end
   end
 
@@ -112,7 +125,7 @@ describe 'chef_client_updater_enterprise_cleanup' do
 
     it 'skips the malformed ident instead of raising or declaring a resource for it' do
       expect { chef_run }.to_not raise_error
-      expect(chef_run).to_not remove_habitat_package('chef-infra-client')
+      expect(removed_idents(chef_run)).to be_empty
     end
   end
 end

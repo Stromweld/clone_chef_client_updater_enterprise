@@ -33,12 +33,13 @@ The `use` partial DSL requires Chef Infra Client >= 17.0. This constraint is enf
 
 Two distinct package identities are used in this cookbook. Mixing them up will break installs:
 
-- **`chef-ice`** — The `product_name` for `mixlib-install` API calls and the native OS package
+- **`chef_client_updater_enterprise_binlinks`** — The `product_name` for `mixlib-install` API calls and the native OS package
   name (rpm/deb/msi). Used by the `install` and `remove_omnibus` resources.
 - **`chef/chef-infra-client`** — The Habitat package identifier. Used by the `binlinks` resource
   for `hab pkg binlink`, and by the `cleanup` resource (via a filesystem glob under
-  `/hab/pkgs/`, not the `hab` CLI, for listing) and Chef's built-in `habitat_package` resource for
-  removal.
+  `/hab/pkgs/`, not the `hab` CLI, for listing; removal is driven directly via `hab pkg uninstall`
+  with the full ident, not Chef's built-in `habitat_package` resource — see "Cleanup Removal Uses
+  Direct `hab pkg uninstall`, Not `habitat_package`" below for why).
 
 Do not use `chef/chef-ice` as a Habitat identifier. Do not use `chef/chef-infra-client` as a
 `mixlib-install` product name.
@@ -75,12 +76,14 @@ fails loudly if the symlinked set drifts from the real one.
 
 Since `chef_client_updater_enterprise_*` are custom resources, ChefSpec treats them as opaque no-ops
 unless told to `step_into` them — `converge_resource` defaults `step_into` to all four so their
-`action_class` code actually executes. When asserting on multiple same-named built-in resources
-declared with different property values (e.g. `cleanup`'s `habitat_package 'x' { version v; action
-:remove }` per version removed), do not use ChefSpec's `.with(property: value)` chained matcher: it
-looks up by `(type, name)` only and only ever inspects the *last* declared match. Filter
-`chef_run.resource_collection.all_resources` directly instead (see `removed_habitat_versions` in
-`spec/unit/resources/cleanup_spec.rb`).
+`action_class` code actually executes. `cleanup.rb` declares removal via uniquely-named `execute`
+resources (one per full Habitat ident, e.g. `execute["remove Habitat package
+chef/chef-infra-client/19.1.0/20260101090000"]`) rather than repeated `habitat_package` resources
+sharing one name — see "Cleanup Removal Uses Direct `hab pkg uninstall`, Not `habitat_package`"
+below for why. Because the full ident is baked into each resource's name, ordinary `(type, name)`
+lookup is already unambiguous per removed version; `spec/unit/resources/cleanup_spec.rb`'s
+`removed_idents` helper filters `chef_run.resource_collection.all_resources` by name prefix for
+clarity, not to work around a ChefSpec matcher collision.
 
 ## Sensitive Data
 
@@ -490,6 +493,47 @@ itself introduce a false "not idempotent" result on an otherwise-unrelated conve
 on `chef_client_updater_enterprise_binlinks` have been removed entirely — they're now fully
 redundant (the block already runs every converge unconditionally) and kept the misleading
 appearance of being load-bearing.
+
+## Cleanup Removal Uses Direct `hab pkg uninstall`, Not `habitat_package`
+
+`chef_client_updater_enterprise_cleanup` removes old Habitat versions via a plain `execute`
+resource (`hab pkg uninstall <origin>/<name>/<version>/<release>`, the full ident), not Chef's
+built-in `habitat_package` resource. This is a deliberate workaround for a Chef-core idempotency
+blind spot, not a style preference — do not "simplify" it back without re-verifying the failure
+mode below on a live multi-version Kitchen suite.
+
+**The bug this works around:** `Chef::Provider::Package::Habitat#installed_version` (part of Chef
+core, `lib/chef/provider/package/habitat.rb`) determines whether a version is "installed" by
+running `hab pkg path <bare origin/name>` — with no version qualifier — and comparing whatever
+that resolves to against `new_resource.version`. `hab pkg path` on a bare origin/name resolves
+Habitat's own notion of the *current/active* package for that name, not "does this specific
+version still exist on disk." When multiple `chef/chef-infra-client` versions legitimately coexist
+(the entire reason this cookbook's multi-version support exists), that check can report an older,
+still-present version as "not installed," so `habitat_package ... action :remove` silently no-ops
+instead of removing it — confirmed live via a fresh Dokken `multi-version-almalinux-9` converge:
+after installing 19.2.12 then 19.3.15 with `keep_versions 1`, `cleanup` logged
+`habitat_package[chef/chef-infra-client] action remove (up to date)` and both versions remained on
+disk (`hab pkg list chef/chef-infra-client` still showed both idents).
+
+**The fix:** drive `hab pkg uninstall` directly against the full ident
+(`origin/name/version/release`), bypassing `habitat_package`'s idempotency check entirely. Each
+`execute` resource is named uniquely per ident (`execute["remove Habitat package
+<full-ident>"]`) and carries its own `only_if { File.directory?(...) }` guard, checked directly
+against the actual Habitat package directory for that specific version/release — not against
+`hab`'s own "current" resolution. `HAB_LICENSE=accept-no-persist` is supplied via `environment`
+(same convention as `hab_env` elsewhere in this cookbook) so the command never blocks on an
+interactive license prompt. The Habitat ident backing the currently-running `chef-client` process
+is still excluded from `to_remove` before any `execute` resources are even declared (unchanged from
+before this fix — see `running_hab_ident` usage in `resources/cleanup.rb`).
+
+Both `hab_binary` and the full `ident` are shell-escaped (`Shellwords#shellescape`) before being
+interpolated into the `execute` resource's `command` string — `new_resource.habitat_package` is a
+user-configurable `String` property with no format validation, so it cannot be treated as
+inherently shell-safe.
+
+Unit test coverage (`spec/unit/resources/cleanup_spec.rb`) asserts against the declared
+`execute["remove Habitat package <full-ident>"]` resources and their `command` content directly,
+not a ChefSpec package-resource matcher — see the "Unit Testing (ChefSpec/RSpec)" section above.
 
 ## Chef Core Idempotency-Reporting Bugs to Watch For (Windows)
 

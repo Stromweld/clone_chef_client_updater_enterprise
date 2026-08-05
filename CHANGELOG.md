@@ -81,10 +81,11 @@ This file is used to list changes made in each version of the chef_client_update
   executes and their surrounding `ruby_block` stub/neutralize steps, matching the native
   idempotency `rpm_package`/`windows_package` already provide.
 - `install.rb`: replace `hab_pkg_dirs`-based migration guard with bundle-existence guard; migration is now idempotent — runs only while the bundle file exists on disk
-- `cleanup.rb`: revert package removal from `directory :delete` to `habitat_package :remove`; remove redundant ident split
+- `cleanup.rb`: remove old Habitat versions via direct `hab pkg uninstall <full ident>` (through an `execute` resource), not Chef's built-in `habitat_package` resource. `habitat_package`'s own idempotency check (`Chef::Provider::Package::Habitat#installed_version`) resolves `hab pkg path <bare origin/name>`, which reports whatever Habitat considers the current/active package for that name — not the specific, possibly-older version being removed. With multiple versions coexisting on disk (the normal case this cookbook supports), that check can silently report an older version as "not installed" and skip its removal even though its directory is still present. See AGENTS.md's "Cleanup Removal Uses Direct `hab pkg uninstall`, Not `habitat_package`" for the full rationale.
 - `binlinks.rb`: raise `Chef::Exceptions::ValidationFailed` when requested version is not found in the Habitat package store; remove unused `hab_pkg` local
 - `remove_omnibus.rb`: gate omnibus directory deletion on hab binlink existence (`/usr/bin/chef-client` or `/usr/local/bin/chef-client`) so `/opt/chef` is never removed before the replacement binary is in place
 - `preserve-omnibus` InSpec: remove hard assertion that `/opt/chef` exists post-migration (migrate-ice controls this); verify `/etc/chef` config preservation instead
+- `test/integration/multi-version/default_test.rb`: fix `NameError: undefined local variable or method 'older_version'` — define `older_chef_ice_version = '19.2.12'` locally (matching the Linux branch of `older_chef_ice_version` in the `multi_version.rb` test recipe, which is not itself visible to InSpec's separate process) instead of referencing the never-defined `older_version`.
 
 ## 0.1.0 - *2026-07-09*
 
