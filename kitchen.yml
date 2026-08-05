@@ -41,11 +41,11 @@ platforms:
 lifecycle:
   post_converge:
     - remote: |
-        sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; sudo -E /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json" --no-color'
+        sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
       excludes:
         - windows-2022
     - remote: |
-        C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json --no-color
+        C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
       includes:
         - windows-2022
 
