@@ -32,6 +32,23 @@ platforms:
       customize:
         memory: 4096
 
+# remove_omnibus defers deletion while still running under the legacy omnibus
+# chef-client (see resources/remove_omnibus.rb); this hook performs the
+# genuinely separate second chef-client run needed to complete the removal,
+# invoking the cookbook's own stable binlink directly so it never resolves
+# back to the omnibus binary. See AGENTS.md "Omnibus Removal" for the full
+# rationale.
+lifecycle:
+  post_converge:
+    - remote: |
+        sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; sudo -E /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json" --no-color'
+      excludes:
+        - windows-2022
+    - remote: |
+        C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json --no-color
+      includes:
+        - windows-2022
+
 suites:
   - name: default
     verifier:
@@ -51,22 +68,6 @@ suites:
   - name: remove-omnibus
     provisioner:
       named_run_list: remove_omnibus
-    # remove_omnibus defers deletion while still running under the legacy omnibus
-    # chef-client (see resources/remove_omnibus.rb); this hook performs the
-    # genuinely separate second chef-client run needed to complete the removal,
-    # invoking the cookbook's own stable binlink directly so it never resolves
-    # back to the omnibus binary. See AGENTS.md "Omnibus Removal" for the full
-    # rationale.
-    lifecycle:
-      post_converge:
-        - remote: |
-            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; sudo -E /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json" --no-color'
-          excludes:
-            - windows-2022
-        - remote: |
-            C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json --no-color
-          includes:
-            - windows-2022
     verifier:
       inspec_tests:
         - test/integration/remove-omnibus
