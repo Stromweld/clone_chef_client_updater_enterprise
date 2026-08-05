@@ -143,10 +143,6 @@ action :create do
         ident = resolved_ident
         raise Chef::Exceptions::ValidationFailed,
               'chef_client_updater_enterprise_binlinks: No installed Habitat package found.' unless ident
-
-        # Must pass the explicit ".bat" extension here, NOT the bare "chef-client" name.
-        # Verified on a live Windows Server 2022 instance: `hab pkg binlink chef/hab hab`
-        # fails with "prefix not found"; `hab pkg binlink chef/hab hab.exe` succeeds.
         "#{hab_binary} pkg binlink --force #{ident} chef-client.bat"
       }
       environment hab_env
@@ -156,16 +152,6 @@ action :create do
 
     windows_path 'C:\hab\bin' do
       action :add
-      # `windows_path`'s own `:add` action provider always reports itself
-      # "updated" even when its inner `env "path" { action :modify }`
-      # sub-resource makes no change (confirmed live: the log shows
-      # `windows_env[path] action modify (up to date)` nested directly under
-      # `windows_path[C:\hab\bin] action add`, yet the outer resource still
-      # counts as updated) -- Chef core's `WindowsPath#action :add` has no
-      # idempotency guard of its own and never propagates
-      # `updated_by_last_action(false)` from the sub-resource it declares.
-      # This permanently breaks converge idempotency on every Windows run.
-      # Guard it ourselves by checking the live PATH env var directly.
       not_if do
         current_path = begin
           require 'win32/registry' if windows?

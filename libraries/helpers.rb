@@ -272,14 +272,7 @@ module ChefClientUpdaterEnterprise
       end
     end
 
-    # Returns true if `chef-client` resolves via $PATH (a plain `which`/`where` check, not
-    # anything to do with the CURRENTLY RUNNING process — see running_under_omnibus? for that).
-    # migrate-ice's own `--fresh-install` vs. non-fresh-install branching logic (confirmed live
-    # via /var/log/chef19migrate.log and direct binary testing on EC2) determines "is chef-client
-    # already installed?" by shelling out to `chef-client` via $PATH, NOT by checking for /opt/chef
-    # on disk. This helper mirrors that exact check so `chef_client_updater_enterprise_install` can
-    # decide which of migrate-ice's two paths to invoke. See the `--fresh-install` decision at the
-    # `execute 'migrate-ice apply airgap'` resource for why this distinction matters.
+    # Returns true if `chef-client` resolves via $PATH
     def chef_client_on_path?
       exe = windows? ? 'chef-client.bat' : 'chef-client'
       path_dirs = ENV['PATH'].to_s.split(::File::PATH_SEPARATOR)

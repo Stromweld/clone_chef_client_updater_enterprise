@@ -156,27 +156,10 @@ action_class do
   # Chef Infra Client version: newer releases (e.g. what chef-ice itself ships) default it to a
   # lazy, hab-aware `chef_client_hab_binary_path` block; the chef-client actually bootstrapping
   # this converge (whatever Test Kitchen/production installs as a starting point, e.g. the stable
-  # channel's 18.11.11) instead defaults it to a plain, non-lazy, hardcoded legacy path (confirmed
-  # via direct inspection of that gem's chef_client_scheduled_task.rb — no `lazy {}` at all).
-  # Resetting or re-reading either kind of default can never produce the right value here on an
-  # older bootstrap chef-client, and there is no way to know in advance which kind is running. The
-  # only version-independent fix is to explicitly set chef_binary_path to the resolved, immutable,
-  # fully-versioned Habitat path (ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path
-  # — deliberately NOT the mutable /usr/bin/chef-client binlink symlink; see that helper's comment
-  # for the root-privilege-escalation risk of pointing a root-run scheduled job at a
-  # symlink writable between runs) ourselves before re-running the resource's action, bypassing
-  # whatever default it would otherwise compute entirely. Chef fully compiles the resource
-  # collection before convergence begins (lib/chef/client.rb), so this works regardless of whether
-  # these resources are declared before or after this one in the run_list — but note that
-  # run_context inside an action_class is a CHILD RunContext scoped to this action's own
-  # declarations; root_run_context.resource_collection is required to reach the full, shared,
-  # recipe-level collection.
+  # channel's 18.11.11) instead defaults it to a plain, non-lazy, hardcoded legacy path.
   # Returns true if reconverging any scheduler resource actually changed something (so the
   # calling ruby_block can correctly report its own updated-or-not status instead of always
-  # reporting "updated" just because the block ran) — required for idempotency: this block
-  # runs unconditionally on every converge (see "Scheduler Resource Reconvergence" in
-  # AGENTS.md), so if it always reported itself as updated, no converge running this
-  # cookbook could ever be idempotent, even when nothing on disk actually changed.
+  # reporting "updated" just because the block ran)
   def reconverge_scheduler_resources(resource_collection, resolved_binary_path)
     scheduler_types = %i(chef_client_scheduled_task chef_client_cron chef_client_launchd chef_client_systemd_timer)
     found = resource_collection.all_resources.select { |r| scheduler_types.include?(r.resource_name) }
@@ -196,47 +179,10 @@ action_class do
     any_updated
   end
 
-  # Shared entry point called from BOTH the "already installed, nothing to do"
-  # early-out and the tail of a genuine install/upgrade, so reconvergence runs
-  # on every single converge — not only the converge that happens to perform
-  # an install/upgrade. This is the actual fix for the chef_binary_path
-  # flip-flop bug: an earlier version of this action only reached the
-  # reconvergence logic below when the package-install branch executed,
-  # returning early (skipping reconvergence entirely) on every converge where
-  # chef-ice was already at the pinned/current version. Since resolving a
-  # stable path here is what overrides the scheduler resource's own built-in
-  # default, skipping it left that default's evaluation up to whichever Chef
-  # Infra Client gem happened to be bootstrapping THAT specific converge —
-  # different platforms/CI runs bootstrap from different gem vintages (some
-  # pre-19.x with a hardcoded legacy default, others already chef-ice with a
-  # lazy hab-aware default), so which stale/inconsistent value got left in
-  # place varied by platform. That is why the flip-flop direction was
-  # inconsistent between platforms rather than a simple, single-direction
-  # regression.
-  #
-  # Deliberately called only after the package install/upgrade branch (or the
-  # already-installed short-circuit) has already run in the SAME converge:
-  # chef_client_hab_binary_path must resolve `hab_pkg_dirs`/binlink state as it
-  # exists after this converge's own install+binlink work is finalized, not
-  # whatever was on disk before this action started. Resolving it any earlier
-  # (e.g. once at the top of the action, before the package/migrate-ice/binlink
-  # resources below have actually run) risks resolving a stale, pre-binlink
-  # value on the very converge that installs/upgrades chef-ice for the first
-  # time. Calling this once, here, after all of that has completed for both
-  # code paths is what guarantees a single, canonical, stable resolution per
-  # converge.
+
   def reconverge_installed_scheduler_resources(new_resource)
-    # Deliberately NOT chef_client_binlink_path (the mutable /usr/bin/chef-client symlink) — see
-    # ChefClientUpdaterEnterprise::Helpers#chef_client_hab_binary_path for why scheduler resources
-    # must be pointed at the resolved, immutable, fully-versioned Habitat path instead.
-    # Pass new_resource.version so a user pinning to an older, specific version (e.g. to
-    # work around a bug in the latest release) doesn't get silently overridden by a newer
-    # version that may already be present on disk from an earlier install/run.
     resolved_binary_path = chef_client_hab_binary_path(new_resource.habitat_package, new_resource.version)
     update_scheduler_enabled = new_resource.update_scheduler_resources
-    # run_context here is a CHILD RunContext scoped to this action's own nested resource
-    # declarations (empty of sibling recipe-level resources even in unified_mode) — only
-    # root_run_context.resource_collection reaches the full, shared, recipe-level collection.
     resource_collection = run_context.root_run_context.resource_collection
 
     if update_scheduler_enabled && resolved_binary_path.nil?
@@ -246,34 +192,6 @@ action_class do
       )
     end
 
-    # Runs unconditionally on every converge (not gated behind a notification) specifically so it
-    # self-heals on a later no-op converge too, not just the converge that actually
-    # installs/upgrades chef-ice. The individual chef_client_cron/systemd_timer/launchd/
-    # scheduled_task resources are declared with no explicit chef_binary_path in user recipes, so
-    # their own built-in lazy default re-evaluates every single time their action is re-run — on an
-    # older bootstrap chef-client (pre-19.x) that default is a hardcoded legacy omnibus path (see
-    # comment on reconverge_scheduler_resources above), so if this only ran when notified by an
-    # actual chef-ice change, any later unrelated converge would silently flip the scheduler's
-    # binary path back to that stale default with nothing left to correct it. Running every converge
-    # instead means reconverge_scheduler_resources always re-asserts resolved_binary_path, so the
-    # scheduler resource's own idempotency (each resource's underlying template/cron_d/systemd_unit
-    # compares rendered content, not "did chef-ice change this run") is what actually determines
-    # whether anything reports a diff. resolved_binary_path only changes when a NEW chef-ice version
-    # is actually installed (chef_client_hab_binary_path always resolves the latest installed
-    # version's directory), so this can never itself cause a false "not idempotent" result on an
-    # unrelated converge.
-    #
-    # Deliberately a plain Ruby call, NOT a `ruby_block` resource: `Chef::Provider::RubyBlock#
-    # action_run` unconditionally wraps `new_resource.block.call` in `converge_by`, which marks
-    # the ruby_block resource itself "updated" on every single converge regardless of what the
-    # block's own return value or internal `updated_by_last_action` calls indicate — confirmed by
-    # reading chef-ice's own bundled chef gem's `lib/chef/provider/ruby_block.rb`. That made this
-    # step permanently report itself as a change every converge, which broke the CI idempotency
-    # check (`2/17 resources updated` on every second converge, forever) even when
-    # reconverge_scheduler_resources itself found nothing to change. Since the whole resource is
-    # `unified_mode true`, calling this directly as plain Ruby inside the action body runs at
-    # exactly the same point in convergence a `ruby_block` would have, without a wrapper resource
-    # that can misreport its own idempotency.
     return unless update_scheduler_enabled && resolved_binary_path && ::File.exist?(resolved_binary_path)
 
     reconverge_scheduler_resources(resource_collection, resolved_binary_path)
@@ -380,24 +298,13 @@ action :install do
     rpm_package new_resource.product_name do
       source pkg_path
       version pkg_version if pkg_version
-      # `--nodigest` is required on top of `--replacefiles --noscripts`: chef-ice's
-      # published RPMs (built once per release, apparently always on an Amazon
-      # Linux 2 builder regardless of the target `p=<platform>` query param used to
-      # fetch them -- confirmed live: chef-ice-19.3.15's RPM header reports
-      # `Release: 1.amzn2` even when downloaded via `p=fedora`/`p=el` mixlib-install
-      # requests) are missing a modern per-file payload digest. RPM's own payload
-      # verification is a SEPARATE check from the package's GPG signature (which we
-      # already deliberately skip via `--noscripts`'s sibling concerns and the
-      # `remote_file` resource's own `checksum` property, confirmed matching
-      # upstream's sha256 before rpm ever runs). Whether missing-digest packages are
-      # rejected depends entirely on the installed rpm binary's own default
-      # `_pkgverify_level` macro -- confirmed live: rpm 4.x (AlmaLinux/Rocky/RHEL 8/9,
-      # Amazon Linux) silently tolerates it, but Fedora 44's bundled rpm 6.0.2
-      # defaults `_pkgverify_level` to `digest` and hard-fails with `package ...
-      # does not verify: no digest` otherwise. `--nodigest` disables only this
-      # specific payload-digest check (not the SHA256 checksum already verified
-      # above, and not signature verification, already skipped via --noscripts)
-      # and is a no-op/harmless on rpm versions that don't enforce it.
+      # `--nodigest` is required on top of `--replacefiles --noscripts`:
+      # chef-ice's published RPMs are missing a modern per-file payload digest.
+      # Whether missing-digest packages are rejected depends entirely on the
+      # installed rpm binary's own default `_pkgverify_level` macro, Fedora 44's
+      # bundled rpm 6.0.2 defaults `_pkgverify_level` to `digest` and hard-fails
+      # with `package ... does not verify: no digest` otherwise. `--nodigest`
+      # disables only this specific payload-digest check.
       options '--replacefiles --noscripts --nodigest'
       action :install
     end
@@ -534,6 +441,21 @@ action :install do
     # breaking idempotency even though the actual MSI install is correctly a
     # no-op. Skip the whole env-set/install/env-cleanup sequence once this
     # exact version is already installed.
+    # Freshly-created Windows accounts (e.g. CI's `net user /add` local test
+    # user, or any account that has never interactively logged on) can
+    # inherit a PATH containing literal, unexpanded `%SystemRoot%`-style
+    # tokens from the default user profile template instead of resolved
+    # paths. Mixlib::ShellOut on Windows does a literal PATH-directory search
+    # with no shell-style `%` expansion, so an entry like
+    # `%SystemRoot%\system32` never resolves to `C:\Windows\system32` and the
+    # `package` resource's `msiexec` invocation below fails with `'msiexec'
+    # is not recognized as an internal or external command` even though
+    # msiexec.exe is right there on disk. Expand any `%VAR%` tokens against the current
+    # process environment before that resource runs.
+    if ::ENV['PATH'].to_s.include?('%')
+      ::ENV['PATH'] = ::ENV['PATH'].gsub(/%([^%]+)%/) { ::ENV[Regexp.last_match(1)] || Regexp.last_match(0) }
+    end
+
     msi_already_current = pkg_version && installed_version == pkg_version
 
     windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install' do
@@ -549,12 +471,6 @@ action :install do
       version pkg_version if pkg_version
       installer_type :msi
       options 'CHEF_PRESERVE_OMNIBUS=1' if new_resource.preserve_omnibus
-      # Chef's windows_package provider only implements :install (no :upgrade
-      # action exists at all — Chef::Exceptions::UnsupportedAction otherwise).
-      # This is harmless here: each chef-ice version is a distinct MSI
-      # ProductCode/UpgradeCode, so :install always does the right thing
-      # whether or not another version is already present (side-by-side,
-      # not a true Windows-Installer major-upgrade).
       action :install
       # The embedded PostInstall.ps1 custom action runs migrate-ice
       # synchronously as part of the msiexec transaction, which can easily
@@ -589,8 +505,7 @@ action :install do
   #
   # `--fresh-install` is passed CONDITIONALLY, based on whether `chef-client` currently
   # resolves via $PATH (see `chef_client_on_path?` in libraries/helpers.rb). This mirrors
-  # migrate-ice's OWN internal detection exactly (confirmed via /var/log/chef19migrate.log
-  # and direct binary testing on a live EC2 instance):
+  # migrate-ice's OWN internal detection exactly:
   #
   # - When chef-client IS on $PATH (true for every native OS package install of omnibus
   #   Chef — /usr/bin, /opt/chef/bin symlinked in, etc. — so this is the common case on
@@ -610,17 +525,6 @@ action :install do
   #   is required there instead, to skip that check entirely and just extract the bundle
   #   unconditionally.
   #
-  # Getting this wrong is NOT a hard failure either way — both branches exit 0 — which is
-  # exactly why this previously went undetected: unconditionally passing `--fresh-install`
-  # (the previous behavior) silently no-ops on every EC2/native-VM converge where
-  # chef-client is resolvable via $PATH, leaving /hab/pkgs permanently empty and causing
-  # `execute[migrate-ice apply airgap]` to (harmlessly but pointlessly) re-run on every
-  # single subsequent converge forever, since its own `not_if` guard (checking
-  # `hab_pkg_dirs`) can never be satisfied. Confirmed root-caused via SSH onto a live EC2
-  # `preserve-omnibus` instance: `/hab/pkgs/chef/chef-infra-client/` did not exist despite
-  # rpm/dpkg correctly reporting the chef-ice package installed, and this was NOT
-  # reproducible on Dokken (whose minimal images never have chef-client on $PATH).
-  #
   # --process-config ignore skips the running-process check so kitchen converge
   # does not get blocked by the in-flight chef-client process.
   license = new_resource.license_key
@@ -637,32 +541,10 @@ action :install do
     only_if { ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').any? }
     retries 5
     retry_delay 10
-    # `execute` has no built-in idempotency of its own — without this guard it
-    # unconditionally re-runs migrate-ice on every single converge, even when
-    # rpm_package/dpkg already correctly reported "up to date" for the same
-    # pkg_version. `hab_pkg_dirs` is a plain filesystem glob under /hab/pkgs
-    # (not a `hab` binary shell-out) deliberately: at this point in a fresh
-    # migration, `/bin/hab` hasn't been linked yet (that happens further below,
-    # itself dependent on migrate-ice having already run), so checking via the
-    # `hab` binary here would create a chicken-and-egg dependency.
     not_if { pkg_version && hab_pkg_dirs(new_resource.habitat_package).any? { |d| d.split('/')[-2] == pkg_version } }
     notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
   end
 
-  # migrate-ice unpacks a Habitat `hab` package (chef/hab if bundled, else
-  # core/hab) under /hab/pkgs, but does not itself place a `hab` binary on any
-  # of the fixed paths Chef's built-in habitat_package/habitat_install
-  # resources (and this cookbook's own hab_binary helper) look for on
-  # Linux/macOS. Without this, downstream resources like
-  # chef_client_updater_enterprise_cleanup fail with "'hab' binary not
-  # found". Link it in from the Habitat-managed binary migrate-ice already
-  # installed rather than triggering habitat_install's fresh internet
-  # download, which would be redundant and unwanted in airgapped
-  # environments. Windows needs no equivalent bootstrap: hab_binary's
-  # Windows branch (libraries/helpers.rb) resolves hab.exe directly from its
-  # real, fully-nested package path — a flat symlink/copy under
-  # C:\hab\bin\hab.exe breaks hab's own prefix self-detection (confirmed
-  # live via a "XXX prefix not found XXX" error on `pkg binlink`).
   unless windows? || hab_binary
     link '/bin/hab' do
       to lazy {
