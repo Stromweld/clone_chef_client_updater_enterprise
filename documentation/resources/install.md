@@ -41,6 +41,7 @@ Introduced: v0.1.0
 | `manage_binlinks` | true, false | `true` | Automatically run `chef_client_updater_enterprise_binlinks` after a successful install. |
 | `update_scheduler_resources` | true, false | `true` | Reconverges any `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task` resources found in the resource collection whenever the binlinked package version changes — the initial omnibus migration AND every later chef-ice version upgrade. Requires `manage_binlinks true` (or an externally managed, current binlink). |
 | `preserve_omnibus` | true, false | `true` | Pass `--preserve-omnibus` to `migrate-ice` so an existing legacy omnibus Chef installation is left in place instead of being deleted. |
+| `fstab_handling` | `apply`, `fail`, `ignore` | `ignore` when `preserve_omnibus` is `true`, otherwise `apply` | Value passed to `migrate-ice --fstab` on the migration code path, controlling what it does when `/opt/chef` is its own dedicated mount point: `apply` (migrate-ice's default) remounts that device at `/hab`, `fail` aborts, `ignore` leaves the mount alone. See [Mounted `/opt/chef` and `--fstab`](#mounted-optchef-and---fstab). |
 
 ## Preserving Multiple Installed Versions
 
@@ -81,6 +82,37 @@ Platform-specific handling:
   `1800` seconds to accommodate this).
 - **All other platforms (e.g. macOS):** Installs via Chef's built-in `package` resource with no
   special-casing.
+
+## Mounted `/opt/chef` and `--fstab`
+
+`migrate-ice` has two distinct code paths, chosen automatically by this resource (see
+`chef_client_on_path?` in `libraries/helpers.rb`):
+
+- **fresh-install path** (`--fresh-install`, used when no `chef-client` resolves via `$PATH`) —
+  extracts the airgap bundle unconditionally and never touches mounts.
+- **migration path** (no `--fresh-install`, used when `chef-client` IS on `$PATH`) — additionally
+  processes the `--fstab` flag.
+
+On the migration path, `migrate-ice`'s own `--fstab` default is `apply`, which means "take the
+block device currently mounted at `/opt/chef` and remount it at `/hab`". When `/opt/chef` is its
+own mount point this does **not** degrade gracefully — it hard-fails the whole migration and rolls
+back:
+
+```text
+[INFO] /opt/chef is mounted on device <dev>. Proceeding with migration.
+Failure while processing flag `fstab`, Error: error during mount migration:
+  failed to mount <dev> to /hab: exit status 32.
+chef-client migration failed. ... Initiating rollback...
+```
+
+Because that is contradictory with `preserve_omnibus true` (keeping the omnibus install while
+moving the filesystem out from under it), `fstab_handling` defaults to `ignore` whenever
+`preserve_omnibus` is `true`, and only falls back to migrate-ice's own `apply` default when
+`preserve_omnibus` is `false`. Set `fstab_handling` explicitly to override.
+
+This is not a rare edge case: every `kitchen-dokken` container has `/opt/chef` bind-mounted in from
+the `chef/chef` data container, and some sites deliberately keep `/opt/chef` on a dedicated
+filesystem.
 
 ## Scheduler Resource Reconvergence
 

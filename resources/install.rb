@@ -72,6 +72,16 @@ property :preserve_omnibus, [true, false],
          default: true,
          description: 'Pass --preserve-omnibus true to migrate-ice to keep the existing omnibus Chef installation.'
 
+property :fstab_handling, String,
+         equal_to: %w(apply fail ignore),
+         default: lazy { preserve_omnibus ? 'ignore' : 'apply' },
+         description: 'Value passed to migrate-ice\'s --fstab flag on the migration (non---fresh-install) code ' \
+                      'path, controlling what it does when /opt/chef is its own dedicated mount point: ' \
+                      '"apply" (migrate-ice\'s own default) remounts that device at /hab, "fail" aborts, ' \
+                      '"ignore" leaves the mount alone. Defaults to "ignore" whenever preserve_omnibus is true, ' \
+                      'since preserving the omnibus install and moving its filesystem out from under it are ' \
+                      'contradictory, and "apply" hard-fails in that case (see resources/install.rb).'
+
 default_action :install
 
 action_class do
@@ -511,18 +521,41 @@ action :install do
   #   real VMs/EC2), migrate-ice's non-fresh-install path runs a normal, correctly-behaved
   #   migration: it detects the existing version, extracts the bundle, populates
   #   /hab/pkgs, and fully respects --preserve-omnibus (confirmed live: with
-  #   --preserve-omnibus true it logs "/opt/chef is not mounted. Skipping --fstab flag
-  #   handling." and leaves /opt/chef untouched, rather than the mount-remount failure
-  #   this comment previously warned about — that failure mode is real but only triggers
-  #   when /opt/chef genuinely IS mounted as its own dedicated block device, a supported
-  #   customer configuration; when it isn't, migrate-ice degrades gracefully instead of
-  #   erroring).
+  #   --preserve-omnibus true and /opt/chef NOT a mount point it logs "/opt/chef is not
+  #   mounted. Skipping --fstab flag handling." and leaves /opt/chef untouched). When
+  #   /opt/chef IS its own mount point, this path additionally performs --fstab handling,
+  #   which must be suppressed — see the --fstab paragraph below.
   # - When chef-client is NOT on $PATH (normal for minimal Dokken/CI container images that
   #   invoke the bootstrap chef-client by full path rather than via $PATH), the
   #   non-fresh-install path's own "is chef-client installed?" check fails and it silently
   #   no-ops (exit 0, nothing extracted, /hab/pkgs never populated) — so `--fresh-install`
   #   is required there instead, to skip that check entirely and just extract the bundle
   #   unconditionally.
+  #
+  # `--fstab <apply|fail|ignore>` (migrate-ice's own default: `apply`) is passed explicitly on
+  # the migration path from the `fstab_handling` property, which itself defaults to `ignore`
+  # whenever `preserve_omnibus` is true. `apply` means "take the block device currently mounted
+  # at /opt/chef and remount it at /hab", which is actively wrong when we are preserving the
+  # omnibus install — and it doesn't degrade gracefully, it hard-fails the whole migration
+  # (confirmed live):
+  #
+  #     [INFO] /opt/chef is mounted on device <dev>. Proceeding with migration.
+  #     Failure while processing flag `fstab`, Error: error during mount migration:
+  #       failed to mount <dev> to /hab: exit status 32.
+  #     chef-client migration failed. ... Initiating rollback...
+  #
+  # migrate-ice then rolls back, so nothing is installed and the `execute` exits non-zero.
+  # This is NOT a rare edge case: every kitchen-dokken container has /opt/chef bind-mounted
+  # in from the `chef/chef` data container, so ANY converge that reaches the migration path
+  # there fails 100% of the time (this is what broke the multi-version suite on every Linux
+  # platform — the FIRST install takes the --fresh-install path, which never touches fstab,
+  # but it binlinks chef-client onto $PATH, so the SECOND install in the same converge takes
+  # the migration path and dies). It is equally reachable on real customer systems that keep
+  # /opt/chef on a dedicated filesystem.
+  #
+  # The flag is only appended on the migration path: the --fresh-install path does not process
+  # fstab at all (it isn't in that path's validated-flag set), so passing it there would be
+  # dead weight.
   #
   # --process-config ignore skips the running-process check so kitchen converge
   # does not get blocked by the in-flight chef-client process.
@@ -531,8 +564,11 @@ action :install do
     command lazy {
       bundle = ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').max_by { |f| ::File.mtime(f) }
       preserve_flag = new_resource.preserve_omnibus ? ' --preserve-omnibus true' : ''
-      fresh_flag = chef_client_on_path? ? '' : ' --fresh-install'
-      "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore --license-key #{license}#{preserve_flag}#{fresh_flag}"
+      fresh_install = !chef_client_on_path?
+      fresh_flag = fresh_install ? ' --fresh-install' : ''
+      fstab_flag = fresh_install ? '' : " --fstab #{new_resource.fstab_handling}"
+      "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore " \
+        "--license-key #{license}#{preserve_flag}#{fresh_flag}#{fstab_flag}"
     }
     environment lazy { { 'CHEF_LICENSE_KEY' => license.to_s } }
     sensitive true

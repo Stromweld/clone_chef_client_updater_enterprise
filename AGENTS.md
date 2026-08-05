@@ -262,6 +262,33 @@ Do not go back to unconditionally passing `--fresh-install`, and do not gate the
 `File.directory?('/opt/chef')` either (reintroduces a mount-remount failure mode) —
 `chef_client_on_path?` is the one check that matches migrate-ice's own internal logic exactly.
 
+## `--fstab ignore` Is Required Whenever the Migration Path Runs With `preserve_omnibus`
+
+`migrate-ice`'s `--fstab` flag (values `apply`/`fail`/`ignore`, default `apply`) is only processed
+on the **migration** path (i.e. when `--fresh-install` is NOT passed). `apply` means "remount the
+device currently mounted at `/opt/chef` onto `/hab`". When `/opt/chef` is genuinely its own mount
+point, that hard-fails the entire migration and rolls back:
+
+```text
+[INFO] /opt/chef is mounted on device <dev>. Proceeding with migration.
+Failure while processing flag `fstab`, Error: error during mount migration:
+  failed to mount <dev> to /hab: exit status 32.
+```
+
+Every kitchen-dokken container bind-mounts `/opt/chef` in from the `chef/chef` data container, so
+this fires 100% of the time in Dokken CI on any converge that reaches the migration path. That is
+exactly what broke the `multi-version` suite on every Linux platform: the FIRST install takes the
+`--fresh-install` path (fstab never processed) but binlinks `chef-client` onto `$PATH`, so the
+SECOND install in the same converge takes the migration path and dies. `remove-omnibus`/`default`/
+`preserve-omnibus`/`scheduler-fix` never hit it because they only ever install once per converge.
+
+The `fstab_handling` property defaults to `ignore` whenever `preserve_omnibus` is true (preserving
+the omnibus install and moving its filesystem out from under it are contradictory) and to
+migrate-ice's own `apply` otherwise. Do not drop the flag or make it unconditional `apply`; do not
+"fix" this by forcing `--fresh-install` on the upgrade path instead — `--fresh-install` refuses to
+run when a chef-client is already installed, so it would silently no-op and never extract the new
+version.
+
 **`execute[migrate-ice apply airgap]` carries `retries 3` / `retry_delay 5`** to work around an
 upstream migrate-ice/Go-runtime GC race (`fatal error: lfstack.push ... created by
 runtime.gcBgMarkStartWorkers`, exit code 2) that occurs under CPU-constrained/virtualized/emulated
