@@ -10,9 +10,11 @@
 #   4. Binlink to the newest version present on disk
 #   5. Cleanup, keeping only that newest version
 #
-# NOTE: step 3 makes the end state depend on the current stable channel. The
-# `expected_chef_ice_version` InSpec input in kitchen.yml must be bumped in
-# lockstep whenever a newer chef-ice than 19.3.15 is promoted to stable.
+# NOTE: step 3 makes the end state depend on the current stable channel, so it
+# is NOT pinned in the verifier. test/integration/multi-version/default_test.rb
+# queries the Commercial Download API's /versions/latest endpoint for whatever
+# `latest` resolves to at verify time. Do not reintroduce a hardcoded
+# `expected_chef_ice_version` input for this suite.
 #
 # The "older" starting version differs by platform: chef-ice's Windows MSI
 # only gained CHEF_PRESERVE_OMNIBUS support in builds after ~2026-04-23

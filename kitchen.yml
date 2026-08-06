@@ -37,17 +37,12 @@ suites:
     verifier:
       inspec_tests:
         - test/integration/default
-      inputs:
-        expected_chef_ice_version: '19.3.15'
   - name: preserve-omnibus
     provisioner:
       named_run_list: preserve_omnibus
     verifier:
       inspec_tests:
         - test/integration/preserve-omnibus
-      inputs:
-        expected_chef_ice_version: '19.3.15'
-
   - name: remove-omnibus
     provisioner:
       named_run_list: remove_omnibus
@@ -73,9 +68,6 @@ suites:
     verifier:
       inspec_tests:
         - test/integration/remove-omnibus
-      inputs:
-        expected_chef_ice_version: '19.3.15'
-
   - name: multi-version
     provisioner:
       named_run_list: multi_version
@@ -84,14 +76,10 @@ suites:
       inspec_tests:
         - test/integration/multi-version
       inputs:
-        expected_chef_ice_version: '19.3.15'
         older_chef_ice_version: '19.2.12'
-
   - name: scheduler-fix
     provisioner:
       named_run_list: scheduler_fix
     verifier:
       inspec_tests:
         - test/integration/scheduler-fix
-      inputs:
-        expected_chef_ice_version: '19.3.15'

@@ -16,6 +16,9 @@ bin/*
 .kitchen/
 kitchen.local.yml
 
+# inspec
+inspec.lock
+
 # Chef Infra
 Berksfile.lock
 .zero-knife.rb
