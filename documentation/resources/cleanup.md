@@ -19,10 +19,9 @@ Introduced: v0.1.0
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `habitat_package` | String | `'chef/chef-infra-client'` | Habitat package identifier to clean up. |
-| `product_name` | String | `'chef-ice'` | Native OS package name (not used directly by this resource). |
-| `legacy_omnibus_package` | String | `'chef'` | Legacy omnibus package name (not used directly by this resource). |
-| `keep_versions` | Integer | `1` | Number of most recently installed Habitat versions to retain. |
+| `habitat_package` | String | `'chef/chef-infra-client'` | Habitat package identifier to clean up. Must be a bare `origin/name` ident. |
+| `version` | String | `'latest'` | Accepted via the shared property partial but not used by this resource. |
+| `keep_versions` | Integer | `1` | Number of most recently installed Habitat versions to retain. Must be `1` or greater. |
 
 ## Examples
 

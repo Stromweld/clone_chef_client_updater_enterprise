@@ -1,9 +1,3 @@
 ---
 AllCops:
   NewCops: enable
-  TargetChefVersion: '17.0'
-  Exclude:
-    - 'test/cookbooks/**/*'
-    - 'spec/**/*'
-    - 'Gemfile'
-    - 'Policyfile.rb'

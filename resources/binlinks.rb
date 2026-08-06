@@ -25,8 +25,9 @@ provides :chef_client_updater_enterprise_binlinks
 use 'partials'
 
 property :force, [true, false],
+         desired_state: false,
          default: true,
-         description: 'Overwrite an existing symlink or file at the destination path.'
+         description: 'Overwrite an existing non-symlink file at the destination path.'
 
 default_action :create
 
@@ -37,7 +38,7 @@ action_class do
     dirs = hab_pkg_dirs(new_resource.habitat_package)
     return if dirs.empty?
 
-    if new_resource.version.downcase == 'latest'
+    if new_resource.version == 'latest'
       target_dir = dirs.last
     else
       target_dir = dirs.select { |d| d.include?("/#{new_resource.version}/") }.last
@@ -102,13 +103,9 @@ action :create do
 
     # Only remove a pre-existing stale destination when it is a *non-symlink* file
     # (e.g. an old omnibus binary at /usr/bin/chef-client). `hab pkg binlink --force`
-    # already replaces a symlink whose target has changed on its own; force-deleting
-    # a correct, up-to-date symlink here on every converge is what made this resource
-    # non-idempotent.
-    ruby_block "remove stale binlink #{dest}" do
-      block do
-        ::File.unlink(dest)
-      end
+    # already replaces a symlink whose target has changed on its own.
+    file dest do
+      action :delete
       only_if do
         next false unless new_resource.force
         next false if ::File.directory?(dest)
@@ -154,11 +151,14 @@ action :create do
       action :add
       not_if do
         current_path = begin
+          # LoadError is a ScriptError, not a StandardError, so it must be named
+          # explicitly — a bare `rescue StandardError` would let a missing
+          # win32/registry abort the converge instead of falling back to ENV.
           require 'win32/registry' if windows?
           ::Win32::Registry::HKEY_LOCAL_MACHINE.open(
             'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
           ) { |reg| reg['path'] }
-                       rescue StandardError
+                       rescue StandardError, LoadError
                          ENV['PATH'].to_s
         end
         current_path.split(::File::PATH_SEPARATOR).any? { |p| p.casecmp('C:\hab\bin').zero? }
@@ -168,10 +168,9 @@ action :create do
 end
 
 action :remove do
-  Chef::Log.warn(
-    'chef_client_updater_enterprise_binlinks :remove — ' \
-    'Symlink removal is not implemented. ' \
-    'Manually remove the symlink at /usr/bin/chef-client (Linux), ' \
-    '/usr/local/bin/chef-client (macOS), or C:\\hab\\bin\\chef-client.bat (Windows).'
-  )
+  dest = link_dest
+
+  file dest do
+    action :delete
+  end
 end

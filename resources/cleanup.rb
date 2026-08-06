@@ -27,6 +27,7 @@ provides :chef_client_updater_enterprise_cleanup
 use 'partials'
 
 property :keep_versions, Integer,
+         callbacks: { 'must be at least 1' => ->(v) { v >= 1 } },
          default: 1,
          description: 'Number of most recently installed Habitat versions to retain.'
 

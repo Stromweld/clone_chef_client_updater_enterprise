@@ -29,6 +29,7 @@ property :legacy_omnibus_package, String,
          default: 'chef'
 
 property :remove_directories, [true, false],
+         desired_state: false,
          default: true,
          description: 'Remove legacy omnibus installation directories after package uninstall.'
 

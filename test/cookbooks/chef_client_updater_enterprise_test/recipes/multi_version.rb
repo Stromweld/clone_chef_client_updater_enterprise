@@ -4,10 +4,15 @@
 # Recipe:: multi_version
 #
 # Tests version-pinned upgrade scenario:
-#   1. Install older version with no binlinks
-#   2. Install newer version (19.3.15) — upgrade
-#   3. Binlink to newest installed version
-#   4. Cleanup keeping only 1 version
+#   1. Install older version, no binlinks, no scheduler reconvergence
+#   2. Install 19.3.15, still no binlinks/reconvergence
+#   3. Install whatever the channel currently resolves to as latest
+#   4. Binlink to the newest version present on disk
+#   5. Cleanup, keeping only that newest version
+#
+# NOTE: step 3 makes the end state depend on the current stable channel. The
+# `expected_chef_ice_version` InSpec input in kitchen.yml must be bumped in
+# lockstep whenever a newer chef-ice than 19.3.15 is promoted to stable.
 #
 # The "older" starting version differs by platform: chef-ice's Windows MSI
 # only gained CHEF_PRESERVE_OMNIBUS support in builds after ~2026-04-23
@@ -38,7 +43,7 @@ chef_client_updater_enterprise_install 'install latest' do
   license_key node['chef_client_updater_enterprise']['license_key']
 end
 
-# Binlink to newest installed version (auto-detects 19.3.15)
+# Binlink to the newest version installed above
 chef_client_updater_enterprise_binlinks 'binlink chef-ice'
 
 # Cleanup, keep only the most recent version

@@ -18,9 +18,12 @@
 # limitations under the License.
 
 property :habitat_package, String,
-         description: 'Habitat package identifier.',
+         regex: %r{\A[a-zA-Z0-9][\w.-]*/[a-zA-Z0-9][\w.-]*\z},
+         description: 'Habitat package identifier, as a bare `origin/name` ident.',
          default: 'chef/chef-infra-client'
 
 property :version, String,
-         description: "Version to install. 'latest' resolves to latest stable.",
+         coerce: proc { |v| v.to_s.casecmp('latest').zero? ? 'latest' : v.to_s },
+         description: "Version to install. 'latest' (any casing) resolves to the latest release " \
+                      'in the configured channel.',
          default: 'latest'

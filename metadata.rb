@@ -3,7 +3,7 @@ maintainer 'Corey Hemminger'
 maintainer_email 'hemminger@hotmail.com'
 license 'Apache-2.0'
 description 'Installs and manages Chef Infra Client via chef-ice native OS packages, Habitat binlinks, and cleanup of legacy omnibus installations.'
-version '0.1.0'
+version '0.2.0'
 
 # Resource:: partials with the `use` directive require Chef Infra Client >= 17.0.
 chef_version '>= 17.0'

@@ -26,54 +26,78 @@ provides :chef_client_updater_enterprise_install
 
 use 'partials'
 
-property :license_key, String,
-         # sensitive: true, # TODO: remove comment before publishing
+property :license_key, [String, NilClass],
+         sensitive: true,
+         desired_state: false,
          description: 'Chef license key (CHEF_LICENSE_KEY). Required for chef-ice downloads.',
          default: lazy { ENV.fetch('CHEF_LICENSE_KEY', nil) }
 
 property :product_name, String,
-         description: 'Mixlib-install product name and native OS package name.',
+         description: 'Commercial Download API product key and native OS package name.',
          default: 'chef-ice'
 
-property :channel, Symbol,
+property :channel, [String, Symbol],
          equal_to: %i(stable current),
-         description: 'Download channel.',
+         coerce: proc { |c| c.to_s.downcase.to_sym },
+         description: 'Download channel. Accepts a String or a Symbol in any casing.',
          default: :stable
 
 property :download_dir, String,
+         desired_state: false,
          default: lazy { Chef::Config[:file_cache_path] },
          description: 'Directory to stage downloaded packages before install.'
 
 property :download_url, String,
-         description: 'Direct package URL bypassing mixlib-install. Use for airgapped environments or local file servers.'
+         desired_state: false,
+         description: 'Direct package URL bypassing the Commercial Download API. Use for airgapped environments or local file servers.'
 
 property :checksum, String,
+         desired_state: false,
          description: 'SHA256 checksum for the direct download_url package.'
 
+property :download_retries, Integer,
+         desired_state: false,
+         callbacks: { 'must be zero or greater' => ->(v) { v >= 0 } },
+         default: 5,
+         description: 'Times to retry the package download. A newly published release can be ' \
+                      'advertised by the Commercial Download API before it has propagated to the ' \
+                      "caller's nearest CDN edge (most often for the Windows MSI), so the first " \
+                      'attempts may 403/404 or return a body that fails checksum verification.'
+
+property :download_retry_delay, Integer,
+         desired_state: false,
+         callbacks: { 'must be zero or greater' => ->(v) { v >= 0 } },
+         default: 30,
+         description: 'Seconds to wait between package download attempts. Raise this (or ' \
+                      'download_retries) if a slow CDN edge needs longer to serve a brand-new release.'
+
 property :manage_binlinks, [true, false],
+         desired_state: false,
          default: true,
          description: 'Automatically run the binlinks resource after a successful install.'
 
 property :update_scheduler_resources, [true, false],
+         desired_state: false,
          default: true,
-         description: 'Reconverges any chef_client_cron/chef_client_launchd/chef_client_systemd_timer/' \
-                      'chef_client_scheduled_task resources found in the resource collection whenever the ' \
-                      'binlinked package version changes — the initial omnibus-to-chef-ice migration AND ' \
-                      'every later chef-ice version upgrade. Re-running each resource\'s own previously ' \
-                      'declared action(s) causes its chef_binary_path property (a Chef lazy default) to ' \
-                      're-evaluate against the now-current binlink, so the next scheduled run picks up the ' \
-                      'newly installed chef-client. This works regardless of whether those resources are ' \
-                      'declared before or after this one, since Chef fully compiles the resource collection ' \
-                      'before convergence begins. Requires manage_binlinks true (or an externally managed, ' \
-                      'current binlink). Set false only if an external mechanism already keeps those ' \
-                      'resources\' chef_binary_path current.'
+         description: 'When this converge actually installs a new chef-ice version, reconverge any ' \
+                      'chef_client_cron/chef_client_launchd/chef_client_systemd_timer/' \
+                      'chef_client_scheduled_task resources found in the resource collection, ' \
+                      'explicitly setting their chef_binary_path to the just-installed Habitat ' \
+                      'binary so the next scheduled run uses the new chef-client. This works ' \
+                      'regardless of whether those resources are declared before or after this one, ' \
+                      'since Chef fully compiles the resource collection before convergence begins. ' \
+                      'Requires manage_binlinks true (or an externally managed, current binlink). ' \
+                      'Set false only if an external mechanism already keeps those resources\' ' \
+                      'chef_binary_path current.'
 
 property :preserve_omnibus, [true, false],
+         desired_state: false,
          default: true,
          description: 'Pass --preserve-omnibus true to migrate-ice to keep the existing omnibus Chef installation.'
 
 property :fstab_handling, String,
          equal_to: %w(apply fail ignore),
+         desired_state: false,
          default: lazy { preserve_omnibus ? 'ignore' : 'apply' },
          description: 'Value passed to migrate-ice\'s --fstab flag on the migration (non---fresh-install) code ' \
                       'path, controlling what it does when /opt/chef is its own dedicated mount point: ' \
@@ -87,24 +111,6 @@ default_action :install
 action_class do
   include ChefClientUpdaterEnterprise::Helpers
 
-  # Ensure mixlib-install gem is loaded at compile time.
-  def install_mixlib_install_gem
-    gem_cache_path = ::File.join(Chef::Config[:file_cache_path], 'mixlib-install.gem')
-
-    cookbook_file gem_cache_path do
-      source 'mixlib-install.gem'
-      cookbook 'chef_client_updater_enterprise'
-      action :nothing
-    end.run_action(:create)
-
-    chef_gem 'mixlib-install' do
-      source gem_cache_path
-      clear_sources true
-      compile_time true
-      action :install
-    end
-  end
-
   def validate_license!
     if new_resource.license_key.nil? || new_resource.license_key.to_s.strip.empty?
       raise Chef::Exceptions::ConfigurationError,
@@ -114,79 +120,53 @@ action_class do
     end
   end
 
+  # Resolves the artifact's download URL, sha256 and concrete version via Chef's
+  # Commercial Download API. Returns a Hash with 'url', 'sha256' and 'version'.
   def artifact_info
-    require 'mixlib/install'
+    api_platform, api_platform_version = download_api_platform_info
 
-    product_version = new_resource.version == 'latest' ? :latest : new_resource.version
-    mixlib_platform, mixlib_platform_version = mixlib_install_platform_info
-    options = {
-      product_name: new_resource.product_name,
-      product_version: product_version,
+    commercial_artifact_metadata(
+      product: new_resource.product_name,
+      version: new_resource.version,
       channel: new_resource.channel,
-      license_id: new_resource.license_key,
-      platform: mixlib_platform,
-      platform_version: mixlib_platform_version,
-      architecture: node['kernel']['machine'] == 'arm64' ? 'aarch64' : node['kernel']['machine'],
-      # Published artifacts are not built for every exact platform_version (e.g.
-      # a new Ubuntu/RHEL point release); fall back to the closest older
-      # compatible artifact rather than raising ArtifactsNotFound.
-      platform_version_compatibility_mode: true,
-    }
-
-    result = Mixlib::Install.new(options).artifact_info
-
-    return result unless result.is_a?(Array)
-    raise "No matching artifact for #{mixlib_platform}/#{mixlib_platform_version}" if result.empty?
-
-    result.first
+      license_key: new_resource.license_key,
+      platform: api_platform,
+      platform_version: api_platform_version,
+      architecture: node['kernel']['machine'] == 'arm64' ? 'aarch64' : node['kernel']['machine']
+    )
   end
 
-  def package_extension(_url)
-    if windows?
-      'msi'
-    elsif platform_family?('rhel', 'amazon', 'suse', 'fedora')
-      'rpm'
-    elsif platform_family?('debian')
-      'deb'
-    elsif platform_family?('mac_os_x')
-      'dmg'
-    else
-      raise "Unsupported platform family '#{node['platform_family']}' for chef-ice package install"
-    end
-  end
+  # Resolves the package file extension from the URL the artifact is actually
+  # fetched from, raising an actionable error when it cannot be derived. Both call
+  # sites work from a full file URL (see Helpers#package_extension_from_url), so a
+  # nil here means the URL does not point at an installable package.
+  def package_extension_for(url)
+    ext = package_extension_from_url(url)
+    return ext if ext
 
-  def direct_artifact_url?(url)
-    path = URI.parse(url).path
-    %w(.rpm .deb .msi .dmg .pkg).any? { |ext| path.end_with?(ext) }
-  rescue URI::InvalidURIError
-    false
+    raise Chef::Exceptions::ValidationFailed,
+          'chef_client_updater_enterprise_install: could not determine a package type from ' \
+          "#{url.to_s.split('?').first} — the URL's path must end in one of " \
+          "#{ChefClientUpdaterEnterprise::Helpers::PACKAGE_EXTENSIONS.map { |e| ".#{e}" }.join(', ')}."
   end
 
   # chef_client_cron/launchd/systemd_timer/scheduled_task's chef_binary_path default varies by
   # Chef Infra Client version: newer releases (e.g. what chef-ice itself ships) default it to a
-  # lazy, hab-aware `chef_client_hab_binary_path` block; the chef-client actually bootstrapping
-  # this converge (whatever Test Kitchen/production installs as a starting point, e.g. the stable
-  # channel's 18.11.11) instead defaults it to a plain, non-lazy, hardcoded legacy path.
-  # Returns true if reconverging any scheduler resource actually changed something (so the
-  # calling ruby_block can correctly report its own updated-or-not status instead of always
-  # reporting "updated" just because the block ran)
+  # lazy, hab-aware `chef_client_hab_binary_path` block.
   def reconverge_scheduler_resources(resource_collection, resolved_binary_path)
     scheduler_types = %i(chef_client_scheduled_task chef_client_cron chef_client_launchd chef_client_systemd_timer)
     found = resource_collection.all_resources.select { |r| scheduler_types.include?(r.resource_name) }
 
     if found.empty?
       Chef::Log.debug('chef_client_updater_enterprise: no chef-client scheduler resources found to reconverge.')
-      return false
+      return
     end
 
-    any_updated = false
     found.each do |resource|
-      Chef::Log.info("chef_client_updater_enterprise: reconverging #{resource} for the newly installed binary.")
+      Chef::Log.info("chef_client_updater_enterprise: reconverging #{resource} for the newly installed binary at #{resolved_binary_path}.")
       resource.chef_binary_path(resolved_binary_path) if resource.respond_to?(:chef_binary_path)
       resource.action.each { |a| resource.run_action(a) }
-      any_updated ||= resource.updated_by_last_action?
     end
-    any_updated
   end
 
   def reconverge_installed_scheduler_resources(new_resource)
@@ -218,34 +198,69 @@ action :install do
   end
 
   if new_resource.download_url
-    # Direct download path — skip mixlib-install entirely
+    # Direct download path — skip the Commercial Download API entirely
     pkg_url = new_resource.download_url
-    pkg_ext = package_extension(pkg_url)
+    pkg_ext = package_extension_for(pkg_url)
     safe_ver = new_resource.version == 'latest' ? 'custom' : new_resource.version
     pkg_path = ::File.join(new_resource.download_dir, "#{new_resource.product_name}-#{safe_ver}.#{pkg_ext}")
     file_checksum = new_resource.checksum
-    # 'latest' has no known version when bypassing mixlib-install; the package
+    # 'latest' has no known version when bypassing the Commercial Download API; the package
     # resource's own source-file inspection is the only idempotency signal available.
     pkg_version = new_resource.version == 'latest' ? nil : new_resource.version
   else
-    # mixlib-install path
+    # Commercial Download API path
     validate_license!
-    install_mixlib_install_gem
 
     artifact = artifact_info
     raise "No artifact found for #{new_resource.product_name} #{new_resource.version}" if artifact.nil?
 
-    pkg_url = artifact.url
-    pkg_ext = package_extension(pkg_url)
-    pkg_path = ::File.join(new_resource.download_dir, "#{new_resource.product_name}-#{artifact.version}.#{pkg_ext}")
-    # Handler/redirect URLs (no file extension in path) return checksums that don't match the response body
-    file_checksum = direct_artifact_url?(pkg_url) ? artifact.sha256 : nil
-    pkg_version = artifact.version
+    pkg_url = artifact['url']
+    pkg_ext = package_extension_for(pkg_url)
+    pkg_path = ::File.join(new_resource.download_dir, "#{new_resource.product_name}-#{artifact['version']}.#{pkg_ext}")
+    file_checksum = artifact['sha256']
+    pkg_version = artifact['version']
   end
+
+  # Downloads routinely fail for a few minutes after a new release appears: the
+  # Commercial Download API advertises the version as soon as it is published, but
+  # the artifact still has to propagate to the caller's nearest CDN edge. Until it
+  # does, that edge answers with a 403/404 (or, worse, a short error-page body with
+  # a 200). This is most pronounced for the Windows MSI.
+  #
+  # Two properties handle that, and they are load-bearing together:
+  #
+  #   retries/retry_delay — re-run the whole download on ANY failure, including the
+  #     CDN's 403/404 and the verify failure below.
+  #   verify — remote_file's own `checksum` property does NOT verify the download.
+  #     It only compares an ALREADY-PRESENT local file to decide whether to skip
+  #     fetching (Chef::Provider::RemoteFile::Content#current_resource_matches_target_checksum?).
+  #     The verify block is what actually enforces the API-advertised sha256 against
+  #     the freshly-staged tempfile, so a truncated transfer or a CDN error page is
+  #     rejected instead of being handed to rpm/dpkg/msiexec as a "package".
+  #
+  # Retrying is safe: verification happens before the tempfile is moved into place,
+  # so a rejected body never becomes the cached artifact, and
+  # CacheControlData.load_and_validate discards its saved etag/mtime whenever they
+  # don't match the local file — the retry re-downloads in full rather than being
+  # answered with a 304.
+  expected_checksum = file_checksum
 
   remote_file pkg_path do
     source pkg_url
-    checksum file_checksum if file_checksum
+    checksum expected_checksum if expected_checksum
+    retries new_resource.download_retries
+    retry_delay new_resource.download_retry_delay
+    if expected_checksum
+      verify do |path|
+        actual = Chef::Digester.checksum_for_file(path)
+        unless actual == expected_checksum
+          Chef::Log.warn('chef_client_updater_enterprise_install: downloaded artifact checksum ' \
+                         "#{actual} does not match the expected #{expected_checksum} — the CDN " \
+                         'has most likely not finished propagating this release yet; retrying.')
+        end
+        actual == expected_checksum
+      end
+    end
     sensitive true
     action :create
   end
@@ -380,6 +395,20 @@ action :install do
     # for an explicitly pinned, already-installed version).
     dpkg_already_current = pkg_version && current_native_version(new_resource.product_name) == pkg_version
 
+    # Self-heal: a converge that died between stubbing migrate-ice and restoring
+    # it (an unhandled error elsewhere in the run, a reboot, a SIGKILL) leaves the
+    # real binary parked at migrate_ice_backup. Put it back BEFORE `dpkg --unpack`
+    # runs — restoring afterwards would clobber the newly-unpacked release's
+    # migrate-ice with the previous release's copy. Deliberately NOT guarded by
+    # `dpkg_already_current`: a stranded backup has to be reclaimed regardless of
+    # whether this converge goes on to install anything.
+    ruby_block "restore migrate-ice stranded by an earlier converge (#{pkg_path})" do
+      block do
+        ::FileUtils.mv(migrate_ice_backup, migrate_ice_bin, force: true)
+      end
+      only_if { ::File.exist?(migrate_ice_backup) }
+    end
+
     ruby_block "neutralize old #{new_resource.product_name} postrm before upgrade (#{pkg_path})" do
       block do
         ::File.write(old_postrm, "#!/bin/sh\nexit 0\n")
@@ -394,23 +423,28 @@ action :install do
       not_if { dpkg_already_current }
     end
 
-    ruby_block "stub migrate-ice before dpkg configure (#{pkg_path})" do
+    # Steps 2-4 (stub migrate-ice, `dpkg --configure`, restore migrate-ice) are
+    # deliberately ONE `ruby_block` with a `begin/ensure` rather than three
+    # separately declared Chef resources. Chef has no cross-resource `ensure`:
+    # when `dpkg --configure` fails, the run aborts and any separately-declared
+    # "restore" resource never converges, leaving /hab/migration/bin/migrate-ice
+    # as a permanent `#!/bin/sh exit 0` stub. Every subsequent converge would
+    # then run `execute[migrate-ice apply airgap]` against that stub, which exits
+    # 0 without extracting anything — chef-ice would appear to install
+    # successfully forever while /hab/pkgs stayed empty. Keeping all three phases
+    # in a single block guarantees the real binary is put back even when dpkg
+    # raises, and the exception still propagates and fails the converge.
+    ruby_block "dpkg --configure #{new_resource.product_name} with migrate-ice stubbed (#{pkg_path})" do
       block do
         ::FileUtils.mv(migrate_ice_bin, migrate_ice_backup, force: true) if ::File.exist?(migrate_ice_bin)
         ::File.write(migrate_ice_bin, "#!/bin/sh\nexit 0\n")
         ::FileUtils.chmod(0o755, migrate_ice_bin)
-      end
-      not_if { dpkg_already_current }
-    end
 
-    execute "dpkg --configure #{new_resource.product_name} (#{pkg_path})" do
-      command "dpkg --configure #{new_resource.product_name}"
-      not_if { dpkg_already_current }
-    end
-
-    ruby_block "restore real migrate-ice after dpkg configure (#{pkg_path})" do
-      block do
-        ::FileUtils.mv(migrate_ice_backup, migrate_ice_bin, force: true) if ::File.exist?(migrate_ice_backup)
+        begin
+          shell_out!("dpkg --configure #{new_resource.product_name}")
+        ensure
+          ::FileUtils.mv(migrate_ice_backup, migrate_ice_bin, force: true) if ::File.exist?(migrate_ice_backup)
+        end
       end
       not_if { dpkg_already_current }
     end
@@ -490,6 +524,7 @@ action :install do
       # completion regardless (Chef's shell_out just stops waiting and
       # raises), so a short timeout here only produces a false failure.
       timeout 1800
+      notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
     end
 
     windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install (cleanup)' do
@@ -502,6 +537,7 @@ action :install do
       source pkg_path
       version pkg_version if pkg_version
       action pkg_action
+      notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
     end
   end
 
@@ -596,9 +632,11 @@ action :install do
     end
   end
 
-  # Update any chef_client_scheduled_task/chef_client_cron/chef_client_launchd/chef_client_systemd_timer resources
-  # declared in the resources collection to point at the newly-installed Habitat binary path to run the new client on it's next run.
-  # This will reconverge the scheduler resource that was found with the new binary path.
+  # Repoint any chef_client_scheduled_task/chef_client_cron/chef_client_launchd/
+  # chef_client_systemd_timer resource in the run's resource collection at the
+  # chef-ice version this converge just installed, so the next SCHEDULED run uses
+  # the new client instead of whatever binary the schedule was originally written
+  # against.
   ruby_block 'reconverge installed scheduler resources' do
     block { reconverge_installed_scheduler_resources(new_resource) }
     action :nothing

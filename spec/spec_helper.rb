@@ -12,12 +12,12 @@ COOKBOOK_ROOT = File.expand_path('..', __dir__)
 # treats custom resources as opaque no-ops unless told to `step_into` them, so
 # every unit spec needs its own resource's action_class code to actually run
 # (that's the whole point of testing it) — default to stepping into all of them.
-ALL_CUSTOM_RESOURCES = %w[
+ALL_CUSTOM_RESOURCES = %w(
   chef_client_updater_enterprise_install
   chef_client_updater_enterprise_binlinks
   chef_client_updater_enterprise_cleanup
   chef_client_updater_enterprise_remove_omnibus
-].freeze
+).freeze
 
 # ChefSpec::SoloRunner#converge_block only compiles recipes/resources for
 # cookbooks named in the run_list. This cookbook has no recipes/ directory
@@ -44,4 +44,3 @@ def converge_resource(**options, &block)
   end
   runner
 end
-

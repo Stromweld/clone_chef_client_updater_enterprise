@@ -32,9 +32,10 @@ describe 'chef_client_updater_enterprise_cleanup' do
   # so — unlike the old habitat_package-based test — a plain type/name matcher
   # is inherently unambiguous per ident already. Collect the full set for clarity.
   def removed_idents(chef_run)
-    chef_run.resource_collection.all_resources.select do |r|
+    execs = chef_run.resource_collection.all_resources.select do |r|
       r.resource_name == :execute && r.name.start_with?('remove Habitat package ')
-    end.map { |r| r.name.delete_prefix('remove Habitat package ') }
+    end
+    execs.map { |r| r.name.delete_prefix('remove Habitat package ') }
   end
 
   context 'fewer installed versions than keep_versions' do
@@ -123,9 +124,33 @@ describe 'chef_client_updater_enterprise_cleanup' do
       end
     end
 
-    it 'skips the malformed ident instead of raising or declaring a resource for it' do
-      expect { chef_run }.to_not raise_error
-      expect(removed_idents(chef_run)).to be_empty
+    # The shared `habitat_package` property in resources/_partials.rb constrains
+    # the value to a bare `origin/name` ident, so this is now rejected up front
+    # with an actionable message rather than silently degrading into "nothing was
+    # cleaned up" at converge time. `resources/cleanup.rb` still carries its own
+    # malformed-ident guard as defense in depth.
+    it 'is rejected by property validation rather than silently cleaning nothing up' do
+      expect { chef_run }.to raise_error(
+        Chef::Exceptions::ValidationFailed, /habitat_package/
+      )
+    end
+  end
+
+  context 'keep_versions is set below 1' do
+    let(:chef_run) do
+      stub_installed_dirs('/hab/pkgs/chef/chef-infra-client', [])
+
+      converge_resource do
+        chef_client_updater_enterprise_cleanup 'trim' do
+          keep_versions 0
+        end
+      end
+    end
+
+    it 'is rejected rather than removing every installed version' do
+      expect { chef_run }.to raise_error(
+        Chef::Exceptions::ValidationFailed, /keep_versions/
+      )
     end
   end
 end
