@@ -38,7 +38,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
       - name: Install Chef
-        uses: Stromweld/chef-install-1@d01551c1a92901c938d21ddfc5e3fd8749d9f44d
+        uses: actionshub/chef-install@main
         with:
           license: ${{ vars.CHEF_LICENSE_KEY }}
           chefDownloadUrl: chefdownload-commercial.chef.io
@@ -119,7 +119,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
       - name: Install Chef
-        uses: Stromweld/chef-install-1@d01551c1a92901c938d21ddfc5e3fd8749d9f44d
+        uses: actionshub/chef-install@main
         with:
           license: ${{ vars.CHEF_LICENSE_KEY }}
           chefDownloadUrl: chefdownload-commercial.chef.io
