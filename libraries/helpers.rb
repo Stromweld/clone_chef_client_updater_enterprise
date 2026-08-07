@@ -56,6 +56,17 @@ module ChefClientUpdaterEnterprise
       Timeout::Error,
     ].freeze
 
+    # Value passed as the `TARGETDIR` MSI property when installing chef-ice on
+    # Windows. MSI directory properties are required to carry a trailing
+    # backslash, and this MUST agree with the `C:\hab` root assumed by
+    # #hab_pkg_root and #chef_client_binlink_dir.
+    #
+    # Only chef-ice 19.3.15 and newer set TARGETDIR themselves (via a
+    # `SetTARGETDIR = [WindowsVolume]` custom action). On older MSIs Windows
+    # Installer resolves it from ROOTDRIVE — the fixed drive with the most free
+    # space — which is not necessarily the Windows volume.
+    WINDOWS_MSI_TARGETDIR = 'C:\\'
+
     # Returns the full path to the hab binary, or nil if not found.
     def hab_binary
       if windows?
@@ -112,10 +123,7 @@ module ChefClientUpdaterEnterprise
 
     # Returns the full stable path to the chef-client binlink: a real symlink on
     # Linux/macOS, a generated `.bat` shim on Windows. This is a convenience path
-    # exposed for other resources (chef_client_updater_enterprise_binlinks' `--dest`,
-    # end-user recipes/InSpec checks that just want "the current chef-client"), but is
-    # NOT what scheduler resources should be pointed at via `chef_binary_path` — see
-    # chef_client_hab_binary_path below for why.
+    # exposed for other resources.
     def chef_client_binlink_path
       if windows?
         "#{chef_client_binlink_dir}\\chef-client.bat"
@@ -124,7 +132,19 @@ module ChefClientUpdaterEnterprise
       end
     end
 
-    # Returns the full path to the chef-client binary inside a Habitat package.
+    # Returns the path a scheduler resource's `chef_binary_path` should point at.
+    #
+    # On Linux/macOS this is the fully-versioned path *inside* the Habitat package,
+    # because the binlink there is a bare symlink at a well-known, mutable location
+    # (/usr/bin/chef-client).
+    #
+    # Windows is deliberately the exception. `hab pkg binlink` does not create a
+    # symlink there; it generates a .bat shim whose *contents* name the resolved,
+    # fully-versioned package path, so the version is pinned inside the file rather
+    # than by the path used to reach it. Chef core's own
+    # Chef::Resource::Helpers::PathHelpers#chef_client_hab_binary_path — the default
+    # for every chef_client_* scheduler resource's chef_binary_path — short-circuits
+    # to exactly this shim on Windows.
     def chef_client_hab_binary_path(pkg, version = nil)
       dirs = hab_pkg_dirs(pkg)
       target_dir =
@@ -135,8 +155,35 @@ module ChefClientUpdaterEnterprise
         end
       return unless target_dir
 
+      if windows?
+        binlink = chef_client_binlink_path
+        return binlink if windows_binlink_targets?(binlink, target_dir)
+
+        Chef::Log.warn(
+          "chef_client_updater_enterprise: #{binlink} does not reference #{target_dir}, so it would " \
+          'schedule the wrong chef-client version; pointing the schedule at the versioned Habitat ' \
+          'path instead. Set manage_binlinks true (or refresh the binlink) to keep the two aligned.'
+        )
+      end
+
       bin_name = windows? ? 'chef-client.bat' : 'chef-client'
       ::File.join(target_dir, 'bin', bin_name)
+    end
+
+    # True when the Windows `.bat` binlink shim at `path` names the Habitat package
+    # directory `target_dir` — i.e. the shim really does resolve to that exact
+    # version/release. Compares on the trailing ORIGIN/NAME/VERSION/RELEASE ident
+    # rather than the whole string so the drive/root prefix and separator style the
+    # shim happens to use are irrelevant (hab_pkg_dirs yields forward slashes on
+    # Windows; `hab pkg binlink` writes backslashes).
+    def windows_binlink_targets?(path, target_dir)
+      return false unless target_dir
+      return false unless ::File.exist?(path)
+
+      ident = target_dir.tr('\\', '/').split('/').last(4).join('\\')
+      ::File.read(path).tr('/', '\\').include?(ident)
+    rescue Errno::ENOENT
+      false
     end
 
     # Returns a sorted array of VERSION/RELEASE subdirectory paths under hab_pkg_root(pkg).

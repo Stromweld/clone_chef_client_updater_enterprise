@@ -162,6 +162,92 @@ describe ChefClientUpdaterEnterprise::Helpers do
       )
     end
 
+    # Windows is the deliberate exception to "never the binlink": `hab pkg binlink`
+    # writes a .bat shim whose CONTENTS name the versioned package path, and Chef
+    # core's own chef_binary_path default resolves to that shim. Returning anything
+    # else makes every scheduler resource report updated on every converge.
+    it 'short-circuits to the C:\\hab\\bin shim on Windows when it names the resolved version' do
+      host.fake_windows = true
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      allow(::File).to receive(:exist?).with('C:\hab\bin\chef-client.bat').and_return(true)
+      allow(::File).to receive(:read).with('C:\hab\bin\chef-client.bat')
+                                     .and_return('@echo off\nC:\hab\pkgs\chef\chef-infra-client\19.3.15\20260601120000\bin\chef-client.bat %*')
+
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq('C:\hab\bin\chef-client.bat')
+    end
+
+    # The shim pinning the version is the ENTIRE justification for using it. A shim
+    # left behind by a previous install still names the old package directory, so
+    # trusting it on sight (as Chef core's own helper does) would schedule the very
+    # version this converge just replaced.
+    it 'ignores a stale Windows shim that still names a previously installed version' do
+      host.fake_windows = true
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000',
+         'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      allow(::File).to receive(:exist?).with('C:\hab\bin\chef-client.bat').and_return(true)
+      allow(::File).to receive(:read).with('C:\hab\bin\chef-client.bat')
+                                     .and_return('C:\hab\pkgs\chef\chef-infra-client\19.2.12\20260101090000\bin\chef-client.bat %*')
+
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client.bat'
+      )
+    end
+
+    # Same release, different version directory must not match on a substring alone.
+    it 'matches the shim on the full origin/name/version/release ident' do
+      host.fake_windows = true
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      allow(::File).to receive(:exist?).with('C:\hab\bin\chef-client.bat').and_return(true)
+      allow(::File).to receive(:read).with('C:\hab\bin\chef-client.bat')
+                                     .and_return('C:\hab\pkgs\chef\chef-infra-client\19.3.150\20260601120000\bin\chef-client.bat %*')
+
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client.bat'
+      )
+    end
+
+    it 'short-circuits to the shim on Windows when it names the explicitly pinned version' do
+      host.fake_windows = true
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.2.12/20260101090000',
+         'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      allow(::File).to receive(:exist?).with('C:\hab\bin\chef-client.bat').and_return(true)
+      allow(::File).to receive(:read).with('C:\hab\bin\chef-client.bat')
+                                     .and_return('C:\hab\pkgs\chef\chef-infra-client\19.2.12\20260101090000\bin\chef-client.bat %*')
+
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client', '19.2.12')).to eq(
+        'C:\hab\bin\chef-client.bat'
+      )
+    end
+
+    it 'falls back to the versioned Habitat path on Windows when no shim exists yet' do
+      host.fake_windows = true
+      allow(::File).to receive(:exist?).with('C:\hab\bin\chef-client.bat').and_return(false)
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        'C:/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client.bat'
+      )
+    end
+
+    it 'never short-circuits to the binlink on Linux, even when it exists' do
+      allow(::File).to receive(:exist?).with('/usr/bin/chef-client').and_return(true)
+      allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(
+        ['/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000']
+      )
+      expect(host.chef_client_hab_binary_path('chef/chef-infra-client')).to eq(
+        '/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client'
+      )
+    end
+
     it 'resolves to the pinned older version\'s directory when multiple versions are installed ' \
        'and an explicit version is given, even though a newer one exists on disk' do
       allow(host).to receive(:hab_pkg_dirs).with('chef/chef-infra-client').and_return(

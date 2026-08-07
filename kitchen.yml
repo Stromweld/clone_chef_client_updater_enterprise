@@ -49,17 +49,22 @@ suites:
     # Resource gates on not removing the omnibus if it's the currently running version of infra-client,
     # so we need to run the chef-client converge in a separate step after the main converge using the newly
     # installed version of chef-client to ensure the omnibus version is removed.
+    #
+    # Both variants set the license variables explicitly: a lifecycle hook opens a
+    # fresh shell on the target that inherits nothing from the kitchen host, so
+    # without them chef-client stops at an interactive "Do you accept the 1 product
+    # license?" prompt for Habitat and exits 1.
     lifecycle:
       post_converge:
         - remote: |
-            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
+            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; export CHEF_LICENSE=accept-no-persist; export HAB_LICENSE=accept-no-persist; export CHEF_LICENSE_KEY="<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>"; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
           excludes:
             - windows-2022
             - windows-2025
             - windows-11
             - windows-latest
         - remote: |
-            C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
+            $env:CHEF_LICENSE='accept-no-persist'; $env:HAB_LICENSE='accept-no-persist'; $env:CHEF_LICENSE_KEY='<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>'; $env:TEST_KITCHEN='1'; $env:IS_KITCHEN='true'; C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
           includes:
             - windows-2022
             - windows-2025

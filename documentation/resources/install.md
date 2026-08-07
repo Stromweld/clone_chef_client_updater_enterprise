@@ -142,7 +142,11 @@ Platform-specific handling:
   `migrate-ice --preserve-omnibus`. Note: this MSI property only exists on `chef-ice` releases
   built on/after ~2026-04-23; older releases always migrate destructively regardless of this
   setting. The MSI install can legitimately take 7-13 minutes (the `timeout` property defaults to
-  `1800` seconds to accommodate this).
+  `1800` seconds to accommodate this). Also always passes `TARGETDIR=C:\` so the payload lands on
+  the Windows volume — `chef-ice` MSIs older than 19.3.15 do not set `TARGETDIR` themselves, and
+  Windows Installer would otherwise fall back to `ROOTDRIVE` (the fixed drive with the most free
+  space), installing to e.g. `D:\hab` where neither the package's own `PostInstall.ps1` nor this
+  cookbook's `C:\hab`-based path helpers can find anything.
 - **All other platforms (e.g. macOS):** Installs via Chef's built-in `package` resource with no
   special-casing.
 
@@ -189,13 +193,29 @@ process handoff (re-exec or exit) of any kind is involved, on any platform.
 The sole purpose is to point an existing schedule at the newly-installed client so its next
 *scheduled* run uses it.
 
-`chef_binary_path` is set to the **fully-versioned Habitat path** (for example
+On Linux and macOS, `chef_binary_path` is set to the **fully-versioned Habitat path** (for example
 `/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client`), not the
 `/usr/bin/chef-client` binlink. The scheduler resources re-resolve `chef_binary_path` at every
 scheduled invocation, running as root/SYSTEM, so a writable well-known symlink there would be a
 standing local privilege-escalation target between chef-client runs. If `version` is pinned, the
 pinned version is resolved rather than simply the newest one present on disk, so an intentional
 rollback is not silently undone.
+
+**Windows is the exception**: `chef_binary_path` is set to `C:\hab\bin\chef-client.bat` when that
+shim resolves to the version this converge installed. `hab pkg binlink` does not create a symlink on
+Windows — it generates a `.bat` shim whose *contents* name the resolved, fully-versioned package
+path, so the version is pinned inside the file and there is no mutable indirection to hijack. This
+is also exactly what Chef Infra Client's own `chef_binary_path` default resolves to on Windows;
+using any other value would leave the scheduled task permanently out of sync with that default, so
+every converge that re-evaluated it would report the task as updated.
+
+Because the shim's *contents* are what actually decide which client the next scheduled run executes,
+the shim is verified before it is used. A shim left behind by a previous install still names the old
+package directory, so following it blindly would schedule the very version this converge replaced.
+When the shim does not name the resolved version, the resource logs a warning and points the
+schedule at the fully-versioned Habitat path instead. With the default `manage_binlinks true` this
+never happens — the binlink is refreshed earlier in the same converge — so the fallback only shows up
+when the binlink is externally managed and has gone stale.
 
 The property is set explicitly rather than left to whatever default the resource would otherwise
 compute: the chef-client actually bootstrapping the converge may be an older release (e.g. the

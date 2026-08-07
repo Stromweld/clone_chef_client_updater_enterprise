@@ -474,16 +474,11 @@ action :install do
     #   read, so setting it immediately before the package resource runs is reliable
     #   even though the Windows Installer service process itself may have started
     #   long before this converge).
-    # `windows_package`'s own idempotency (a DisplayName/version registry lookup)
-    # already makes the `package` resource below correctly report "up to date"
-    # when this exact version is already installed. But the `windows_env`
-    # create/delete pair that brackets it has NO idempotency check of its own —
-    # `:create` unconditionally (re)writes the Machine env var and `:delete`
-    # unconditionally removes it, so without a guard this pair reports 2
-    # "updated" resources on every single converge forever, permanently
-    # breaking idempotency even though the actual MSI install is correctly a
-    # no-op. Skip the whole env-set/install/env-cleanup sequence once this
-    # exact version is already installed.
+    # - `TARGETDIR` MUST be pinned to the Windows volume (see WINDOWS_MSI_TARGETDIR
+    #   in libraries/helpers.rb). chef-ice MSIs older than 19.3.15 do not set it
+    #   themselves, so Windows Installer falls back to ROOTDRIVE — the fixed drive
+    #   with the MOST FREE SPACE, which is frequently not C:.
+    #
     # Freshly-created Windows accounts (e.g. CI's `net user /add` local test
     # user, or any account that has never interactively logged on) can
     # inherit a PATH containing literal, unexpanded `%SystemRoot%`-style
@@ -501,21 +496,49 @@ action :install do
     # are actually there.
     repair_windows_path!
 
-    msi_already_current = pkg_version && installed_version == pkg_version
-
+    # The Machine-scoped CHEF_LICENSE_KEY env var is the ONLY channel through
+    # which the MSI's embedded PostInstall.ps1 can receive a license key, but it
+    # must not be left behind on disk, and `windows_env` has NO idempotency of
+    # its own: `:create` unconditionally (re)writes the value and `:delete`
+    # unconditionally removes it. Declared with `action :nothing` and driven
+    # exclusively by notifications from the `package` resource below, so the
+    # pair converges only when msiexec actually runs.
+    #
+    # A `:before` notification is what makes this exact: Chef::Runner#run_action
+    # runs the notifying resource in forced why-run FIRST and only fires the
+    # notification when that pass reports the resource as updated. The decision
+    # is therefore delegated wholesale to `windows_package`'s own MSI
+    # ProductCode/version check — no second, independently-derived "is it already
+    # installed?" guard to drift out of sync with it. An earlier version compared
+    # a registry DisplayVersion scraped by PowerShell against the API-advertised
+    # version; whenever those two strings disagreed the pair reported 2 updated
+    # resources on every converge forever.
     windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install' do
       key_name 'CHEF_LICENSE_KEY'
       value new_resource.license_key
       sensitive true
-      action :create
-      not_if { msi_already_current }
+      action :nothing
     end
+
+    # `TARGETDIR` pins the install root to the Windows volume. Only chef-ice
+    # 19.3.15+ carries its own `SetTARGETDIR = [WindowsVolume]` custom action;
+    # on older MSIs Windows Installer resolves TARGETDIR from ROOTDRIVE — the
+    # fixed drive with the most free space. On a GitHub Actions Windows runner
+    # (C: ~35GB free, D: ~145GB free) that is D:, so the payload lands in
+    # `D:\hab` while the MSI's own PostInstall.ps1 still shells out to the
+    # hardcoded `C:\hab\migration\bin\migrate-ice.exe`, which then does not
+    # exist — msiexec dies with a bare exit 1603 and no diagnostic. Every path
+    # helper in this cookbook (Helpers#hab_pkg_root,
+    # Helpers#chef_client_binlink_dir) also assumes `C:\hab`, so an install
+    # anywhere else is unusable here even when msiexec reports success.
+    msi_options = ["TARGETDIR=#{ChefClientUpdaterEnterprise::Helpers::WINDOWS_MSI_TARGETDIR}"]
+    msi_options << 'CHEF_PRESERVE_OMNIBUS=1' if new_resource.preserve_omnibus
 
     package new_resource.product_name do
       source pkg_path
       version pkg_version if pkg_version
       installer_type :msi
-      options 'CHEF_PRESERVE_OMNIBUS=1' if new_resource.preserve_omnibus
+      options msi_options.join(' ')
       action :install
       # The embedded PostInstall.ps1 custom action runs migrate-ice
       # synchronously as part of the msiexec transaction, which can easily
@@ -524,13 +547,9 @@ action :install do
       # completion regardless (Chef's shell_out just stops waiting and
       # raises), so a short timeout here only produces a false failure.
       timeout 1800
+      notifies :create, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :before
+      notifies :delete, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :delayed
       notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
-    end
-
-    windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install (cleanup)' do
-      key_name 'CHEF_LICENSE_KEY'
-      action :delete
-      not_if { msi_already_current }
     end
   else
     package new_resource.product_name do

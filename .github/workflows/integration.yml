@@ -137,26 +137,84 @@ jobs:
           winrm.cmd quickconfig -q
           net user /add ${{ env.machine_user }} ${{ env.machine_pass }}
           net localgroup administrators ${{ env.machine_user }} /add
+      - name: Enable Windows Installer logging
+        # chef-ice installs via `msiexec /qn`, which prints nothing on failure —
+        # a 1603 reaches the Chef log with empty STDOUT/STDERR and no way to tell
+        # which custom action died. This policy key makes Windows Installer write
+        # a verbose log to %TEMP%\MSI*.LOG for every install on the box, which the
+        # "Collect Windows Installer logs" step below surfaces when a job fails.
+        # Diagnostics only — it does not affect what the cookbook does.
+        run: |
+          New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows\Installer" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx" -PropertyType String -Force | Out-Null
       - name: Kitchen Converge
         run: |
           $env:PATH = "C:\hab\bin;$env:PATH"
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
-      - name: Kitchen Converge again (idempotency check)
-        if: matrix.suite != 'multi-version' && matrix.suite != 'remove-omnibus'
+      - name: Habitat-backed second run (idempotency check)
+        # A second top-level `kitchen converge` re-bootstraps via the
+        # provisioner's own omnibus chef-client (`product_name: chef`,
+        # `product_version: "18"`) regardless of what the first converge
+        # installed, so it can never validate real second-run idempotency here.
+        # Instead — exactly like the Linux job above — invoke the cookbook's own
+        # stable binlink (`C:\hab\bin\chef-client.bat`) against the existing
+        # Kitchen sandbox, as the next scheduled run would, and require that
+        # single run to be fully idempotent (`0/N resources updated`). It goes
+        # through `kitchen exec` so it uses the same WinRM transport/account as
+        # the converge and therefore resolves the same `%TEMP%\kitchen` sandbox.
+        #
+        # `remove-omnibus` IS checked here: its `post_converge` hook has already
+        # completed the deferred omnibus removal by this point, so this run is
+        # the proof that the end state settles. `scheduler-fix` IS checked here
+        # too — on Windows the cookbook points schedules at the same
+        # `C:\hab\bin\chef-client.bat` shim Chef core's own chef_binary_path
+        # default resolves to, so the task no longer flips on every converge.
+        #
+        # Only `multi-version` is excluded: it installs a different Habitat
+        # version on every converge and is never idempotent by design (the Linux
+        # job excludes it for the same reason).
+        if: matrix.suite != 'multi-version'
         shell: pwsh
         run: |
           $env:PATH = "C:\hab\bin;$env:PATH"
           $logPath = Join-Path $env:RUNNER_TEMP 'second-converge.log'
-          kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | Tee-Object -FilePath $logPath
+          # `kitchen exec` opens a fresh WinRM shell on the target, which
+          # inherits NOTHING from this runner process — so the license
+          # acceptance variables must be set inside the remote command itself,
+          # exactly as the Linux job passes them via `docker exec -e`. Without
+          # them chef-client stops at an interactive "Do you accept the 1
+          # product license? [yes/No/quit]" prompt for Habitat and exits 1.
+          $prefix = "`$env:CHEF_LICENSE='accept-no-persist'; `$env:HAB_LICENSE='accept-no-persist'; `$env:CHEF_LICENSE_KEY='${{ vars.CHEF_LICENSE_KEY }}'; `$env:TEST_KITCHEN='1'; `$env:IS_KITCHEN='true'; "
+          $cmd = $prefix + 'C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json'
+          kitchen exec ${{ matrix.suite }}-${{ matrix.os }} -c $cmd 2>&1 | Tee-Object -FilePath $logPath
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} failed"
+            Write-Host "::error::Habitat-backed second run of ${{ matrix.suite }}-${{ matrix.os }} failed"
             exit $LASTEXITCODE
           }
-          if (Select-String -Path $logPath -Pattern '[1-9][0-9]*/[0-9]+ resources updated' -Quiet) {
-            Write-Host "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} reported resource changes — cookbook is not idempotent"
+          if (-not (Select-String -Path $logPath -Pattern 'Infra Phase complete, 0/[1-9][0-9]* resources updated' -Quiet)) {
+            Write-Host "::error::Habitat-backed second run of ${{ matrix.suite }}-${{ matrix.os }} was not idempotent"
             exit 1
           }
       - name: Kitchen Verify
         run: |
           $env:PATH = "C:\hab\bin;$env:PATH"
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Collect Windows Installer logs
+        # Runs only on failure. `msiexec /qn` surfaces nothing but a numeric exit
+        # code, so without this a 1603 is undiagnosable from CI alone. Prints the
+        # custom-action and error lines from every MSI log written during the job
+        # (both the runner's own profile and the kitchen account's).
+        if: failure()
+        shell: pwsh
+        run: |
+          $dirs = @($env:TEMP, "C:\Users\${{ env.machine_user }}\AppData\Local\Temp", "C:\Windows\Temp") |
+            Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          $logs = Get-ChildItem -Path $dirs -Filter 'MSI*.LOG' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 5
+          if (-not $logs) { Write-Host 'No Windows Installer logs found.'; exit 0 }
+          foreach ($log in $logs) {
+            Write-Host "::group::$($log.FullName)"
+            Select-String -Path $log.FullName -Pattern 'CustomAction|WixQuietExec|Return value 3|Product: |Installation failed|Error \d|migrate-ice|TARGETDIR|PostInstall' |
+              Select-Object -Last 120 | ForEach-Object { $_.Line }
+            Write-Host '::endgroup::'
+          }

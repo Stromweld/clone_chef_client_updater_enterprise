@@ -199,6 +199,58 @@ and preserves the legacy omnibus install when `preserve_omnibus` is true.
 Do not simplify any of this back to a plain `package` resource without re-verifying on a live
 multi-version Kitchen suite that the previous version's files survive an upgrade.
 
+### Windows: `TARGETDIR` Must Be Pinned Explicitly
+
+`install` always passes `TARGETDIR=C:\` (`Helpers::WINDOWS_MSI_TARGETDIR`) in the msiexec `options`,
+independently of `CHEF_PRESERVE_OMNIBUS`. Do not drop it or make it conditional.
+
+Only chef-ice **19.3.15 and newer** carry a `SetTARGETDIR = [WindowsVolume]` custom action
+(sequenced in `InstallExecuteSequence` at 799, condition `NOT TARGETDIR`). Verified by exporting the
+MSI tables of both releases: 19.3.14 has neither the `CustomAction` row nor the sequence entry. On
+those older MSIs Windows Installer resolves `TARGETDIR` from `ROOTDRIVE` — *the fixed drive with the
+most free space*, not the Windows volume. A GitHub Actions `windows-latest` runner ships C: with
+~35GB free and D: with ~145GB free, so the payload lands in `D:\hab`.
+
+Two things then break, and neither produces a useful error:
+
+- The MSI's embedded `PostInstall.ps1` in 19.3.14 hardcodes `$bin = 'C:\hab\migration\bin'` (19.3.15
+  changed this to `Join-Path $PSScriptRoot 'bin'`). With `$ErrorActionPreference = 'Stop'`, the
+  missing `migrate-ice.exe` throws, `WixQuietExec` fails, and msiexec returns a bare **1603** after
+  ~20 seconds with no diagnostic. This is what failed the `multi-version` suite, whose Windows
+  branch installs 19.3.14 first.
+- `Helpers#hab_pkg_root` and `Helpers#chef_client_binlink_dir` hardcode `C:\hab` and `C:\hab\bin`, so
+  even an MSI that installed cleanly elsewhere is invisible to every guard, binlink and scheduler
+  path in this cookbook.
+
+**Reproduced directly** on a clean Windows Server 2022 EC2 instance (single C: volume, no `C:\hab`)
+by installing the 19.3.14 MSI with an explicit off-volume `TARGETDIR` — `msiexec /qn /i
+chef-ice-19.3.14-1_x64.msi TARGETDIR=C:\alt\ /l*v` — which reproduced the CI signature exactly
+(`EXIT=1603` after 21s). The verbose log shows the payload correctly staged at
+`C:\alt\hab\migration\bin\migrate-ice.exe` while `RunPostInstallFresh` invoked
+
+```text
+WixQuietExec: Executing: C:\hab\migration\bin\migrate-ice apply airgap --fresh-install C:\hab\...
+WixQuietExec: Start-Process : This command cannot be run due to the error:
+              The system cannot find the file specified.
+              At C:\alt\hab\migration\PostInstall.ps1:97 char:6
+```
+
+Re-running the same MSI on the same box with `TARGETDIR=C:\` exits 0 in 460s and populates
+`C:\hab\pkgs\chef\chef-infra-client\19.3.14`. Note EC2 instances have a single volume, so `ROOTDRIVE`
+resolves to C: there and the Kitchen `multi-version` suite passes on EC2 with or without this fix —
+**do not conclude from a green EC2 run that the fix is unnecessary.** It is only observable where a
+second fixed drive has more free space than C:, which is exactly the GitHub Actions runner.
+
+Passing `TARGETDIR` explicitly on 19.3.15+ merely makes its own `NOT TARGETDIR` condition false,
+which is harmless — the value is identical. MSI directory properties require the trailing backslash,
+hence `C:\` and not `C:`.
+
+**This was not, on its own, what made `multi-version` fail in CI.** With `TARGETDIR` pinned the
+suite still returned 1603, for the unrelated `C:\hab` file-lock reason documented under
+"`kitchen.proxy.yml` Must Install Omnibus in `pre_converge` AND Pin `chef_client_path`". Pinning
+`TARGETDIR` remains correct and necessary — an off-volume install is genuinely broken for every path
+above — but treat the two as independent failures that happen to share an exit code.
+
 ### Debian Stub/Restore Must Stay in One `ruby_block`
 
 The stub → `dpkg --configure` → restore sequence is a **single** `ruby_block` wrapping `shell_out!`
@@ -267,10 +319,60 @@ Habitat path (`Helpers#chef_client_hab_binary_path`) before re-running its decla
 purpose is to point an existing schedule at the newly-installed client. No re-exec or exit is
 involved, on any platform.
 
-**Do NOT point `chef_binary_path` at the mutable `/usr/bin/chef-client` binlink.** Scheduler
-resources re-resolve it at every *scheduled* invocation as root/SYSTEM, so a writable well-known
-symlink there is a standing local privilege-escalation target between runs. The versioned Habitat
-path points at the immutable, Habitat-verified payload.
+**Do NOT point `chef_binary_path` at the mutable `/usr/bin/chef-client` binlink — on Linux/macOS.**
+Scheduler resources re-resolve it at every *scheduled* invocation as root/SYSTEM, so a writable
+well-known symlink there is a standing local privilege-escalation target between runs. The versioned
+Habitat path points at the immutable, Habitat-verified payload.
+
+**Windows is the deliberate exception**, and `chef_client_hab_binary_path` short-circuits to
+`chef_client_binlink_path` (`C:\hab\bin\chef-client.bat`) there whenever that file exists. Two
+independent reasons, and both must hold:
+
+- **The threat model does not apply.** `hab pkg binlink` does not create a symlink on Windows; it
+  generates a `.bat` shim whose *contents* name the resolved, fully-versioned package path. The
+  version is pinned inside the file rather than by the path used to reach it, so there is no mutable
+  indirection to hijack. `test/integration/scheduler-fix/default_test.rb` asserts this directly —
+  the shim must contain a `hab\pkgs\chef\chef-infra-client` path and the expected version — so the
+  premise can never silently stop being true.
+- **Disagreeing with Chef core is not idempotent.** `Chef::Resource::Helpers::PathHelpers#chef_client_hab_binary_path`
+  — the `chef_binary_path` *default* for every `chef_client_*` scheduler resource — returns exactly
+  that shim on Windows (`return bat_path if File.exist?(bat_path) && ChefUtils.windows?`), and only
+  falls through to `File.realpath($PROGRAM_NAME)` (the versioned path) elsewhere. Returning anything
+  else on Windows guarantees a permanent diff against that default: every converge that re-evaluates
+  it flips the scheduled task back and reports `windows_task[chef-client] task updated`, forever.
+  On Linux the two already agree, which is why only Windows needs the special case.
+
+**The Windows short-circuit is conditional on the shim naming the version resolved for THIS
+converge**, via `Helpers#windows_binlink_targets?`. That the shim pins a version is the whole
+justification for pointing a schedule at it, so it has to be the *right* version: a shim left behind
+by a previous install still names the old package directory, and following it would hand the next
+scheduled run the exact version this converge just replaced. Chef core's own helper does not check
+this — it returns the shim on sight — so the check has to live here. When the shim does not match,
+the cookbook logs a warning and falls back to the versioned Habitat path: correct scheduling wins
+over matching Chef's default, and the resulting `task updated` on later converges is a true signal
+that the binlink is unmanaged or stale, not noise.
+
+`windows_binlink_targets?` compares only the trailing `ORIGIN/NAME/VERSION/RELEASE` ident, because
+`hab_pkg_dirs` yields forward slashes on Windows while `hab pkg binlink` writes backslashes; it
+normalizes separators and requires the full four-segment ident so `19.3.15` cannot match a shim
+naming `19.3.150`.
+
+In practice the fallback is dormant: the reconverge `ruby_block` is driven by a `:delayed`
+notification, and `Chef::Runner#converge` drains those only after every declared resource —
+including `chef_client_updater_enterprise_binlinks`, declared later in `action :install` — has
+already converged. So with `manage_binlinks true` the shim is always freshly rewritten before the
+schedule is repointed. It fires only when `manage_binlinks false` leaves nobody maintaining the
+binlink, or on the `action :install` early-return path (pinned version already installed), which
+returns before `binlinks` is ever declared.
+
+`test/integration/scheduler-fix/default_test.rb` asserts all of this on the target: that the task
+command names the shim, that the shim contains `hab\pkgs\chef\chef-infra-client\<version>\<release>`
+with the version *in position*, and that the two agree with each other.
+
+`spec/unit/libraries/helpers_spec.rb` pins every branch: the Windows short-circuit when the shim
+matches (including when it matches an explicitly pinned older `version`), the fallback when the shim
+is stale, the fallback when no shim exists yet, that a `19.3.150` shim does not satisfy a `19.3.15`
+resolution, and that Linux *never* short-circuits even when `/usr/bin/chef-client` is present.
 
 **Must explicitly SET the property — resetting is not enough.** An older bootstrap chef-client's
 `chef_binary_path` default can be a plain hardcoded path, not a `lazy {}` block at all, so
@@ -290,6 +392,13 @@ the shared collection.
 This does not risk pointing at a version `cleanup` later removes. The delayed notification is
 registered in `install`'s own child `RunContext`, so `Chef::Runner#converge` drains it at the end of
 `install`'s action — not the end of the whole run — so reconvergence happens before `cleanup`.
+
+**On Windows the resolved path is forward-slashed.** `Helpers#hab_pkg_root` returns
+`"C:/hab/pkgs/#{pkg}"` and `chef_client_hab_binary_path` builds on it with `File.join`, so the value
+written into the scheduled task is `C:/hab/pkgs/chef/chef-infra-client/<v>/<release>/bin/
+chef-client.bat`, not a backslashed path. Windows accepts either separator and nothing normalizes
+them, so `test/integration/scheduler-fix/default_test.rb` matches `[\\/]` rather than asserting on
+that incidental formatting — a backslash-only regex there fails against a perfectly correct task.
 
 **Notification-bound, by design.** The `ruby_block` is `action :nothing`, driven only by delayed
 notifications from resources meaning "chef-ice was actually installed or upgraded in *this*
@@ -425,9 +534,49 @@ entries that are already present.
 ## Chef Core Idempotency-Reporting Bugs (Windows)
 
 - **`windows_env` has no built-in idempotency** — create and delete both act unconditionally every
-  converge. The transient `CHEF_LICENSE_KEY` pair in `install` is guarded with
-  `not_if { msi_already_current }` on both actions. Any future one-shot `windows_env` bracketing an
-  idempotent operation needs the same guard.
+  converge. The transient `CHEF_LICENSE_KEY` pair in `install` is therefore declared
+  `action :nothing` and driven **only** by notifications from the `windows_package`:
+  `notifies :create, ..., :before` and `notifies :delete, ...(cleanup)', :delayed`.
+
+  **Do not go back to a `not_if` guard comparing versions.** The previous implementation used
+  `not_if { pkg_version && current_native_version(product_name) == pkg_version }`, i.e. a
+  PowerShell scrape of the registry `Uninstall\*` keys (`DisplayName -like '*chef-ice*'`,
+  `-ExpandProperty DisplayVersion`) compared against the version the Download API advertised. That
+  is a *second, independently-derived* answer to a question `windows_package` already answers via
+  MSI `ProductCode` + `MsiGetProductInfo`. Whenever the two disagreed the pair reported 2 updated
+  resources on every converge forever — which is exactly what failed the `default`,
+  `preserve-omnibus` and `scheduler-fix` Windows suites (`3/16`, `3/11`, `5/14` resources updated on
+  the second converge) even while Chef itself correctly logged
+  `windows_package[chef-ice] action install (up to date)`.
+
+  The `:before` notification makes the decision *exact* rather than merely better: `Chef::Runner`
+  `#run_action` runs the notifying resource in `forced_why_run` first and fires before-notifications
+  only when that pass sets `updated_by_last_action?`, then resets the flag before the real action.
+  Under why-run `ConvergeActions#add_action` skips the block but still marks the resource updated, so
+  nothing installs twice. Verified end-to-end with a scratch `unified_mode true` cookbook: a
+  no-change third converge reports `0/N resources updated` with neither notification firing.
+
+  Both notifications use **string** resource references and both work under `unified_mode`. The
+  `:before` target must be declared *before* the notifying resource (`RunContext#notifies_before`
+  raises `UnifiedModeBeforeSubscriptionEarlierResource` otherwise); the `:delayed` cleanup target is
+  deliberately declared *after* it, and is drained by `Chef::Runner#converge` at the end of
+  `install`'s child `RunContext`. `:immediately` is not used — `RunContext#notifies_immediately` has
+  a unified-mode path that silently downgrades a string reference to "delayed until declaration".
+
+  Any future one-shot `windows_env` bracketing an idempotent operation should use this same
+  notification pattern rather than a hand-rolled guard.
+- **`windows_task` is not idempotent unless `start_time` (and `start_day`) are pinned** —
+  `Chef::Provider::WindowsTask#set_start_day_and_time` assigns `new_resource.start_time =
+  Time.now.strftime('%H:%M')` and `start_day = Time.now.strftime('%m/%d/%Y')` whenever the caller
+  left them nil, and `start_time_updated?` / `start_day_updated?` are guarded on those same
+  properties being truthy. So an unpinned task compares "now" against whatever was stored on the
+  first converge and reports `task updated` as soon as the clock crosses a minute (or midnight)
+  boundary. `chef_client_scheduled_task` leaves both nil by default and forwards them straight
+  through, which is why `test/cookbooks/.../recipes/scheduler_fix.rb` pins `start_time '00:00'` and
+  `start_date '01/01/2026'`. `test/integration/scheduler-fix/default_test.rb` only asserts on the
+  task's *command*, so pinning the schedule does not weaken it. This was necessary but not
+  sufficient on Windows until `chef_client_hab_binary_path` was aligned with Chef core's own
+  `chef_binary_path` default — see "Scheduler Reconvergence" for that second, independent cause.
 - **`windows_path :add` never propagates its inner `env` sub-resource's "no change" status** — the
   outer resource counts as updated even when the nested `env "path"` is up to date.
   `binlinks.rb`'s `windows_path 'C:\hab\bin'` works around this with an explicit `not_if` reading
@@ -499,6 +648,76 @@ instance `ubuntu-2404` — which is why CI matrices name `ubuntu-2404` while the
 **Consequence: any platform-name list inside `kitchen.yml` must cover the union of every file's
 names**, because lifecycle hooks live in `kitchen.yml` but run under whichever driver is active.
 
+### `kitchen.proxy.yml` Must Install Omnibus in `pre_converge` AND Pin `chef_client_path`
+
+The `proxy` driver's target IS the GitHub Actions runner, which already has
+chef-workstation-enterprise installed under `C:\hab`. Unlike the Vagrant and EC2 drivers — whose
+boxes are bare and therefore always get omnibus Chef 18 at `C:\opscode\chef` — the provisioner's
+default `install_strategy: once` detects that Habitat chef-client (`chef installation detected at
+C:\hab\pkgs\chef\chef-infra-client\...`) and **skips its own omnibus bootstrap**. Two suites broke
+on that one difference, and both were misdiagnosed as MSI bugs before the Windows Installer log was
+captured:
+
+- **`multi-version` returned 1603 in ~10s.** The converging chef-client was itself executing out of
+  `C:\hab`, holding `C:\hab\pkgs\core\zlib\1.3.1\...\bin\zlibwapi.dll` open. `migrate-ice` unpacks
+  the chef-ice bundle *into* `C:\hab` and hit that file: `failed to create file ... zlibwapi.dll:
+  The process cannot access the file because it is being used by another process`, then rolled back.
+  This is the Windows analogue of `running_under_omnibus?` — you cannot replace files the running
+  chef-client is executing from.
+- **`preserve-omnibus` failed its `C:\opscode\chef` assertion**, because no omnibus install was ever
+  created. `remove-omnibus` was passing *vacuously* for the same reason.
+
+The fix is **two settings that are only correct together**; either alone leaves the runner converging
+out of `C:\hab`.
+
+1. **A `pre_converge` lifecycle hook installs omnibus Chef 18** via the Commercial Download API,
+   guarded by `Test-Path 'C:\opscode\chef\bin\chef-client.bat'` so it is idempotent.
+   `Kitchen::Instance#transition_to` wraps `run_with_hooks(transition) { send("#{transition}_action") }`,
+   so `pre_converge` completes entirely before `converge_action` — including before the provisioner's
+   own install/bootstrap step. Platform-level `lifecycle:` blocks **merge** with suite-level ones
+   (`kitchen diagnose` confirms `remove-omnibus` carries both this `pre_converge` and its own
+   `post_converge`).
+2. **`provisioner.chef_client_path` is pinned** to `C:\opscode\chef\bin\chef-client.bat`, because
+   installing omnibus is *not by itself sufficient*.
+   `Kitchen::Provisioner::ChefInfra#find_chef_executable` searches, in order:
+   1. `config[:chef_client_path]`
+   2. `C:\hab\chef\bin\chef-client.ps1`
+   3. `C:\hab\pkgs\chef\chef-infra-client\*\*\bin\chef-client.bat`
+   4. `C:\opscode\chef\bin\chef-client.bat`
+
+   **Step 3 precedes step 4**, so with `C:\hab` populated an omnibus install can only win via step 1.
+   And `chef_client_path`'s own default interpolates `chef_omnibus_root`, which is assigned only as a
+   *side effect* of install-command generation (`config[:chef_omnibus_root] = installer.root`); until
+   that runs the default collapses to the useless `"\bin\chef-client.bat"` (confirmed via `kitchen
+   diagnose`). So it must be set explicitly.
+
+Do not "simplify" this back to `install_strategy: always`. That reinstalls omnibus on every converge
+(slow, and it re-creates `C:\opscode\chef` after `remove-omnibus` deletes it) while still losing the
+executable-resolution race at step 3 unless `chef_client_path` is pinned anyway. There is no
+"install omnibus even though some other chef exists" setting — `once` looks for *any* chef-client.
+
+Corollary: a 1603 from the chef-ice MSI is **not** self-diagnosing. `msiexec /qn` yields an empty
+STDOUT/STDERR, so the Chef log shows only `returned 1603`. The Windows CI job enables the Windows
+Installer logging policy and prints the resulting log on failure; leave that in place. Two plausible
+causes (a wrong `TARGETDIR`, and a pre-existing Habitat `chef-infra-client` of a different version)
+were both disproven against live EC2 boxes before the log identified the real one.
+
+### Remote Shells Inherit No Environment
+
+`kitchen exec` and lifecycle `remote:` commands open a **fresh WinRM/SSH shell that inherits nothing**
+from the Kitchen host — `Kitchen::LifecycleHook::Remote#run` goes straight to
+`instance.transport.connection(...)`. Without `HAB_LICENSE` in scope, chef-client stops at an
+interactive `Do you accept the 1 product license? [yes/No/quit]` prompt for **Habitat** and exits 1.
+Every such command therefore sets its licence/kitchen vars inline (`$env:X='...'; ` for PowerShell,
+`export X=...; ` for sh). The Linux/Dokken path never hit this because it passes them via
+`docker exec -e`.
+
+Relatedly, **`kitchen.proxy.yml` repeats the WinRM credentials under an explicit `transport:` block.**
+`Kitchen::Driver::SSHBase#backcompat_merged_state` injects driver credentials on the converge/verify
+path only; `LifecycleHook::Remote#run` calls `instance.transport.connection(state_file.read)`
+directly with no merge, so a hook fails with `password is a required option` if the credentials live
+only under `driver:`.
+
 Do not add a platform without confirming the Commercial Download API publishes chef-ice artifacts
 for it (`GET /<channel>/chef-ice/metadata?p=&pv=&m=` returns HTTP 400 if not). chef-ice publishes no
 macOS artifact, so the `mac_os_x` code paths are declared-but-untested.
@@ -530,6 +749,26 @@ argv array with no shell, so `export FOO=1; ...` fails with `exec: "export": exe
 found in $PATH`. Vagrant's ssh transport already runs a shell, so the wrapper is a harmless no-op
 there. The hook also probes for `/opt/kitchen/client.rb` (Dokken sandbox root) and falls back to
 `/tmp/kitchen` (Vagrant), since both drivers share this one `kitchen.yml`.
+
+**A `remote:` lifecycle hook needs credentials on the TRANSPORT, not just the driver.**
+`kitchen.proxy.yml` (the Windows CI config) declares `host`/`port`/`username`/`password` on the
+`proxy` driver, and that is enough for converge/verify only because
+`Kitchen::Driver::SSHBase#backcompat_merged_state` copies them into the connection.
+`Kitchen::LifecycleHook::Remote#run` calls `instance.transport.connection(state_file.read)`
+directly, with no such merge — so the winrm transport sees `password: nil` and dies with
+`WinRM::ConnectionOpts#validate_required_fields': password is a required option` before the hook
+runs at all. `kitchen.proxy.yml`'s `windows-latest` platform therefore repeats the credentials under
+an explicit `transport:` block. Any new kitchen config growing a `remote:` hook needs the same.
+Verified live: with this in place the hook connects and runs; without it the suite never gets past
+`ConnectionOpts#validate_required_fields`.
+
+**A `remote:` hook — and `kitchen exec` — opens a shell that inherits NOTHING from the kitchen
+host.** `CHEF_LICENSE` / `HAB_LICENSE` exported in CI reach the kitchen process, not the target, so
+chef-client stops at an interactive `Do you accept the 1 product license? [yes/No/quit]` for Habitat
+and exits 1. Both variants of the hook, and the workflow's Habitat-backed idempotency step,
+therefore set the license variables inline in the remote command. The Linux CI job never hit this
+because it passes them explicitly via `docker exec -e`. This is not the same failure as the missing
+transport credentials above — it appears only after those are fixed.
 
 **Keep it scoped to the `remove-omnibus` suite — never move it to top level.** Lifecycle-hook
 `includes`/`excludes` match on PLATFORM name only (`Kitchen::LifecycleHook::Base#should_run?`), so a
@@ -563,12 +802,26 @@ Two things keep every other suite from needing a second pass, and both must hold
   `docker exec`s the cookbook's own stable binlink (`/usr/bin/chef-client`, resolved to confirm it
   is Habitat-backed) and requires `0/N resources updated`. Excluded: `multi-version` only, which
   installs a different Habitat version every converge and is never idempotent by design.
-- **Windows (`kitchen.proxy.yml`, platform `windows-latest`)** — runs a real second
-  `kitchen converge`. Excluded: `multi-version` and `remove-omnibus` (the latter deletes the omnibus
-  chef-client the driver would resolve for a second converge).
+- **Windows (`kitchen.proxy.yml`, platform `windows-latest`)** — mirrors the Linux job: it invokes
+  the cookbook's own stable binlink (`C:\hab\bin\chef-client.bat`) against the existing Kitchen
+  sandbox via `kitchen exec`, and requires `0/N resources updated`. `kitchen exec` is used rather
+  than a bare shell command so the run goes over the same WinRM transport/account as the converge
+  and therefore resolves the same `%TEMP%\kitchen` sandbox; it propagates a non-zero exit code when
+  the command fails (verified). Do NOT go back to a plain second `kitchen converge` — Test Kitchen
+  re-bootstraps via the provisioner's own omnibus chef-client (`product_name: chef`,
+  `product_version: "18"`) regardless of what the first converge installed, so it can never validate
+  real second-run idempotency.
 
-Do not remove these exclusions. `remove-omnibus`'s own `post_converge` hook already re-exercises
-idempotency via the stable chef-ice binlink on every converge.
+  Excluded: `multi-version` only — the same suite the Linux job excludes, and for the same reason
+  (it installs a different Habitat version on every converge and is never idempotent by design).
+
+  `remove-omnibus` **is** checked here. Its `post_converge` hook has already completed the deferred
+  omnibus removal by the time this step runs, so this run is what proves the end state actually
+  settles rather than merely that the hook ran. `scheduler-fix` **is** checked here too, now that
+  `Helpers#chef_client_hab_binary_path` short-circuits to `C:\hab\bin\chef-client.bat` on Windows —
+  the same value Chef core's `chef_binary_path` default resolves to, so the scheduled task no longer
+  flips on every converge. Do not reintroduce either exclusion to paper over a regression in that
+  alignment; see "Scheduler Reconvergence".
 
 ## Local Dokken Testing (Apple Silicon)
 

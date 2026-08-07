@@ -412,4 +412,103 @@ describe 'chef_client_updater_enterprise_install' do
       expect(notification.action).to eq(:run)
     end
   end
+
+  # chef-ice MSIs older than 19.3.15 carry no SetTARGETDIR custom action, so
+  # Windows Installer resolves TARGETDIR from ROOTDRIVE (the fixed drive with
+  # the most free space). Every path helper in this cookbook assumes C:\hab, and
+  # the MSI's own PostInstall.ps1 shells out to a hardcoded
+  # C:\hab\migration\bin\migrate-ice.exe, so an install anywhere else fails with
+  # a bare msiexec 1603.
+  context 'Windows msiexec options' do
+    before do
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:current_native_version).and_return(nil)
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:hab_pkg_dirs).and_return([])
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:repair_windows_path!).and_return(nil)
+    end
+
+    def windows_install(**props)
+      converge_resource(platform: 'windows', version: '2022') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          license_key 'abc'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1.x86_64.msi'
+          checksum 'a' * 64
+          props.each { |k, v| send(k, v) }
+        end
+      end
+    end
+
+    it 'always pins TARGETDIR to the Windows volume' do
+      pkg = windows_install.find_resource(:package, 'chef-ice')
+
+      expect(pkg.options).to include('TARGETDIR=C:\\')
+    end
+
+    it 'adds CHEF_PRESERVE_OMNIBUS only when preserve_omnibus is set' do
+      expect(windows_install(preserve_omnibus: true).find_resource(:package, 'chef-ice').options)
+        .to include('CHEF_PRESERVE_OMNIBUS=1')
+      expect(windows_install(preserve_omnibus: false).find_resource(:package, 'chef-ice').options)
+        .to_not include('CHEF_PRESERVE_OMNIBUS=1')
+    end
+  end
+
+  # windows_env has no idempotency of its own — :create unconditionally rewrites
+  # the value and :delete unconditionally removes it — so the license-key pair
+  # bracketing the MSI install must be action :nothing and driven purely by
+  # notifications from the package resource. The :before notification delegates
+  # the "will this actually install?" decision to windows_package's own MSI
+  # ProductCode/version check rather than a second, independently-derived guard.
+  context 'Windows license key env var wiring' do
+    before do
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:current_native_version).and_return(nil)
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:hab_pkg_dirs).and_return([])
+      allow_any_instance_of(ChefClientUpdaterEnterprise::Helpers)
+        .to receive(:repair_windows_path!).and_return(nil)
+    end
+
+    let(:run) do
+      converge_resource(platform: 'windows', version: '2022') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          license_key 'abc'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1.x86_64.msi'
+          checksum 'a' * 64
+        end
+      end
+    end
+
+    let(:pkg) { run.find_resource(:package, 'chef-ice') }
+
+    it 'declares the env resource with action :nothing' do
+      expect(run.find_resource(:windows_env, 'CHEF_LICENSE_KEY for chef-ice MSI install').action)
+        .to eq([:nothing])
+    end
+
+    it 'creates the env var via a :before notification from the package' do
+      notification = pkg.before_notifications.find do |n|
+        n.resource.to_s == 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]'
+      end
+
+      expect(notification).to_not be_nil
+      expect(notification.action).to eq(:create)
+    end
+
+    it 'deletes the env var via a :delayed notification from the package' do
+      notification = pkg.delayed_notifications.find do |n|
+        n.resource.to_s == 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]' &&
+          n.action == :delete
+      end
+
+      expect(notification).to_not be_nil
+    end
+
+    it 'marks the license key env resource sensitive' do
+      env = run.find_resource(:windows_env, 'CHEF_LICENSE_KEY for chef-ice MSI install')
+
+      expect(env.sensitive).to be true
+    end
+  end
 end

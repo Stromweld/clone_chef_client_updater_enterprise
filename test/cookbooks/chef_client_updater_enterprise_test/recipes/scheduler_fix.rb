@@ -22,7 +22,16 @@ if platform_family?('rhel', 'amazon', 'suse', 'fedora', 'debian')
 elsif platform?('mac_os_x')
   chef_client_launchd 'chef-client'
 elsif windows?
-  chef_client_scheduled_task 'chef-client'
+  # `start_time` and `start_date` MUST both be pinned. chef_client_scheduled_task
+  # leaves them nil by default, and Chef::Provider::WindowsTask#set_start_day_and_time
+  # then fills them in with Time.now on every converge. Its own
+  # start_time_updated?/start_day_updated? comparisons therefore see a difference
+  # as soon as the clock crosses a minute (or midnight) boundary, so windows_task
+  # reports "task updated" forever and the suite can never pass an idempotency check.
+  chef_client_scheduled_task 'chef-client' do
+    start_time '00:00'
+    start_date '01/01/2026'
+  end
 end
 
 chef_client_updater_enterprise_install 'install chef-ice' do
