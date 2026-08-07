@@ -29,10 +29,13 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: false
+      # `hab` must exist on disk because spec/unit/resources/cleanup_spec.rb
+      # exercises the real Helpers#hab_binary, which probes the filesystem and
+      # returns nil when there is none.
       - name: Install chefspec and habitat for unit testing
         run: |
-          curl -sSfL "https://packages.chef.io/files/stable/habitat/latest/hab-x86_64-linux.tar.gz" -o "hab-x86_64-linux.tar.gz"
-          tar -xzf "hab-x86_64-linux.tar.gz" -C "/bin" --strip-components=1
+          curl -sSfL "https://packages.chef.io/files/stable/habitat/latest/hab-x86_64-linux.tar.gz" -o "$RUNNER_TEMP/hab-x86_64-linux.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/hab-x86_64-linux.tar.gz" -C /bin --strip-components=1 --wildcards '*/hab'
           gem install chefspec
           hab --version
       - name: Run RSpec
