@@ -15,17 +15,23 @@ env:
 
 jobs:
   rspec:
+    env:
+      BUNDLE_WITH: ${{ inputs.bundle_with }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby:
+          - 3.4
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-      - name: Install Chef
-        uses: actionshub/chef-install@main
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
         with:
-          license: ${{ vars.CHEF_LICENSE_KEY }}
-          chefDownloadUrl: chefdownload-commercial.chef.io
-          project: chef-workstation-enterprise
-          version: latest
-      - name: Run ChefSpec/RSpec unit tests
-        run: |
-          chef exec rspec
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: false
+      - name: Install rspec
+        run: gem install rspec chefspec
+      - name: Run RSpec
+        run: rspec --format documentation --color
