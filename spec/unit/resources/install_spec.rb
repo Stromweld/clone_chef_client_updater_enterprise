@@ -41,6 +41,20 @@ describe 'chef_client_updater_enterprise_install' do
     allow(::File).to receive(:exist?).with(resolved_binary_path).and_return(true)
   end
 
+  # Inverse of stub_installed_pinned_version: simulates chef-ice NOT installed, so
+  # action :install never takes its "already at the pinned version" early return.
+  # Without this, current_installed_version reads the REAL host: `hab pkg list
+  # chef/chef-infra-client` on a machine that happens to have pinned_version
+  # installed (the CI runner does) short-circuits the action before any resource is
+  # declared, and every expectation about the download resource fails on nil.
+  def stub_not_installed
+    allow(::File).to receive(:executable?).and_return(false)
+    allow(::File).to receive(:directory?).and_call_original
+    allow(::File).to receive(:directory?).with(root).and_return(false)
+    allow(::Dir).to receive(:glob).and_call_original
+    allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return([])
+  end
+
   def scheduler_resource(chef_run, type, name)
     chef_run.resource_collection.all_resources.find { |r| r.resource_name == type && r.name == name }
   end
@@ -131,11 +145,7 @@ describe 'chef_client_updater_enterprise_install' do
   context 'downloading the package artifact' do
     let(:checksum) { 'fe004919ddbf171947c6a59d9bd5d516a61ff30e64cf6e4ddd95521b90cc80af' }
     let(:chef_run) do
-      allow(::File).to receive(:executable?).and_return(false)
-      allow(::File).to receive(:directory?).and_call_original
-      allow(::File).to receive(:directory?).with(root).and_return(false)
-      allow(::Dir).to receive(:glob).and_call_original
-      allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return([])
+      stub_not_installed
       expected = checksum
 
       converge_resource(platform: 'ubuntu', version: '24.04') do
@@ -160,6 +170,8 @@ describe 'chef_client_updater_enterprise_install' do
     # platform-derived guess would stage it as .deb and hand dpkg a file it
     # cannot read.
     it 'derives the staged package extension from the download URL, not the platform' do
+      stub_not_installed
+
       run = converge_resource(platform: 'ubuntu', version: '24.04') do
         chef_client_updater_enterprise_install 'chef-ice' do
           version '19.3.15'
@@ -174,6 +186,8 @@ describe 'chef_client_updater_enterprise_install' do
     end
 
     it 'raises an actionable error when the download URL has no package extension' do
+      stub_not_installed
+
       expect do
         converge_resource(platform: 'ubuntu', version: '24.04') do
           chef_client_updater_enterprise_install 'chef-ice' do
@@ -189,6 +203,8 @@ describe 'chef_client_updater_enterprise_install' do
     # The failure message is built from the URL and would otherwise carry the
     # license_id query parameter into the Chef log.
     it 'does not leak the download URL query string in that error' do
+      stub_not_installed
+
       expect do
         converge_resource(platform: 'ubuntu', version: '24.04') do
           chef_client_updater_enterprise_install 'chef-ice' do
@@ -209,6 +225,8 @@ describe 'chef_client_updater_enterprise_install' do
     end
 
     it 'honors download_retries/download_retry_delay overrides' do
+      stub_not_installed
+
       run = converge_resource(platform: 'ubuntu', version: '24.04') do
         chef_client_updater_enterprise_install 'chef-ice' do
           version '19.3.15'
@@ -262,11 +280,7 @@ describe 'chef_client_updater_enterprise_install' do
     end
 
     def converge_with(&block)
-      allow(::File).to receive(:executable?).and_return(false)
-      allow(::File).to receive(:directory?).and_call_original
-      allow(::File).to receive(:directory?).with(root).and_return(false)
-      allow(::Dir).to receive(:glob).and_call_original
-      allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return([])
+      stub_not_installed
       converge_resource(platform: 'ubuntu', version: '24.04', &block)
     end
 
