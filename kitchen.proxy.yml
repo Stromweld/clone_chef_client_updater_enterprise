@@ -1,0 +1,81 @@
+---
+driver:
+  name: proxy
+  host: localhost
+  reset_command: "exit 0"
+  port: <%= ENV["machine_port"] %>
+  username: <%= ENV["machine_user"] %>
+  password: <%= ENV["machine_pass"] %>
+
+platforms:
+  - name: localhost
+  - name: windows-latest
+    # This platform is the GitHub Actions runner itself, which already has
+    # chef-workstation-enterprise installed under C:\hab — unlike the Vagrant
+    # and EC2 drivers, whose boxes are bare and therefore always get omnibus
+    # Chef at C:\opscode\chef as part of the converge. Two suites broke on that
+    # one difference:
+    #
+    #   - multi-version: with no omnibus present, Kitchen resolved chef-client
+    #     out of C:\hab (see the search order below), so the converging process
+    #     itself held C:\hab\pkgs\core\zlib\...\zlibwapi.dll open. migrate-ice
+    #     unpacks the chef-ice bundle *into* C:\hab and hit that exact file —
+    #     "The process cannot access the file because it is being used by
+    #     another process" — then rolled back and returned 1603.
+    #   - preserve-omnibus: with no omnibus install ever created, its
+    #     C:\opscode\chef assertion could not pass, and remove-omnibus was
+    #     passing vacuously for the same reason.
+    #
+    # Kitchen::Provisioner::ChefInfra#find_chef_executable searches, in order:
+    #   1. config[:chef_client_path]  (defaults to C:\opscode\chef\bin\chef-client.bat)
+    #   2. C:\hab\chef\bin\chef-client.ps1
+    #   3. C:\hab\pkgs\chef\chef-infra-client\*\*\bin\chef-client.bat
+    #   4. C:\opscode\chef\bin\chef-client.bat
+    # Note 3 precedes 4, so an omnibus install only wins via 1 — which it does,
+    # since that is the default. Simply making omnibus *exist* is therefore
+    # enough to restore parity; it does not need install_strategy: always
+    # (which would also reinstall it on every converge).
+    #
+    # This hook is what creates it. It is idempotent, so the second converge in
+    # a `kitchen test` is unaffected, and it is scoped to this platform so it
+    # cannot disturb the Vagrant/EC2/Dokken drivers.
+    #
+    # chef_client_path is pinned rather than left to its default, which is built
+    # from config[:chef_omnibus_root] — a value only assigned as a side effect of
+    # generating the install command (`config[:chef_omnibus_root] = installer.root`
+    # in ChefBase#install_script_contents). Until that runs it is empty, and the
+    # default collapses to "\bin\chef-client.bat", which resolves nowhere and
+    # silently drops the search back to the C:\hab entry this is meant to avoid.
+    # Pinning it makes step 1 deterministic.
+    provisioner:
+      chef_client_path: C:\opscode\chef\bin\chef-client.bat
+    lifecycle:
+      pre_converge:
+        - remote: |
+            if (Test-Path 'C:\opscode\chef\bin\chef-client.bat') {
+              Write-Host 'omnibus Chef Infra Client already present, skipping'
+            } else {
+              $ErrorActionPreference = 'Stop'
+              $ProgressPreference = 'SilentlyContinue'
+              $key = '<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>'
+              $uri = "https://chefdownload-commercial.chef.io/stable/chef/metadata?p=windows&pv=2019&m=x86_64&v=18&direct=true&license_id=$key"
+              $meta = Invoke-RestMethod -UseBasicParsing -Uri $uri
+              $msi = Join-Path $env:TEMP 'chef-omnibus-18.msi'
+              Invoke-WebRequest -UseBasicParsing -Uri $meta.url -OutFile $msi
+              $p = Start-Process msiexec -ArgumentList '/qn','/i',$msi -Wait -PassThru
+              if ($p.ExitCode -ne 0) { throw "omnibus Chef install failed with exit code $($p.ExitCode)" }
+              Write-Host "installed omnibus Chef Infra Client $($meta.version)"
+            }
+    # The proxy driver's own host/port/username/password (above) are injected
+    # into the transport only by Kitchen::Driver::SSHBase#backcompat_merged_state,
+    # which is on the converge/verify path. Lifecycle hooks are NOT:
+    # Kitchen::LifecycleHook::Remote#run calls instance.transport.connection
+    # directly with the raw state file, so an unconfigured winrm transport gets
+    # password: nil and dies with "password is a required option" before the
+    # remove-omnibus suite's post_converge hook can run. Configure the transport
+    # explicitly so both paths have credentials.
+    transport:
+      name: winrm
+      username: <%= ENV["machine_user"] %>
+      password: <%= ENV["machine_pass"] %>
+      port: <%= ENV["machine_port"] %>

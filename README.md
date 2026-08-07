@@ -1,21 +1,10 @@
 # chef_client_updater_enterprise cookbook
 
-Installs and manages Chef Infra Client via `chef-ice` native OS packages using [mixlib-install](https://github.com/chef/mixlib-install), creates [Habitat](https://www.habitat.sh/) binlinks for `chef/chef-infra-client`, and handles cleanup of legacy omnibus installations.
+Installs and manages Chef Infra Client via `chef-ice` native OS packages resolved through [Chef's Commercial Download API](https://docs.chef.io/download/commercial/), creates [Habitat](https://www.habitat.sh/) binlinks for `chef/chef-infra-client`, and handles cleanup of legacy omnibus installations.
 
 ## Requirements
 
 Chef Infra Client >= 17.0 (required for the `use` partial DSL).
-
-### Platforms
-
-- RHEL 7, 8, 9 (CentOS, AlmaLinux, Red Hat Enterprise Linux)
-- Ubuntu 18.04, 22.04, 24.04
-- SLES 15 SP5, SP6 (openSUSE Leap 15)
-- Windows Server 2022
-
-### Dependencies
-
-This cookbook has no external cookbook dependencies. The `mixlib-install` gem is installed at runtime via `chef_gem` inside the install resource.
 
 ## Resources
 
@@ -32,7 +21,19 @@ Set the `CHEF_LICENSE_KEY` environment variable on your nodes, then use the inst
 chef_client_updater_enterprise_install 'default'
 ```
 
-This downloads the latest stable `chef-ice` package, installs it via the native package manager (rpm/deb/msi, preserving any previously installed `chef-ice` version and the legacy omnibus install), creates Habitat binlinks, and re-execs the running `chef-client` process under the new binary. To also clean up old versions and remove a legacy omnibus installation:
+`CHEF_LICENSE_KEY` must be exported wherever the converge actually runs `migrate-ice` (Test Kitchen
+drivers, CI runners, production nodes) — the `install` resource's `license_key` property defaults
+to reading it from the environment, and `migrate-ice apply airgap` fails without a valid key.
+
+This downloads the latest stable `chef-ice` package, installs it via the native package manager
+(rpm/deb/msi, preserving any previously installed `chef-ice` version and the legacy omnibus
+install), and creates Habitat binlinks. The running `chef-client` process is **not** re-executed or
+replaced — the new client takes effect on the next chef-client run. If the node has a
+`chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task`
+schedule declared, the install resource repoints it at the newly installed client so that next
+scheduled run picks it up.
+
+To also clean up old versions and remove a legacy omnibus installation:
 
 ```ruby
 chef_client_updater_enterprise_install 'default'

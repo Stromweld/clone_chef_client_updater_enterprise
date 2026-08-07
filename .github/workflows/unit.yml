@@ -16,16 +16,27 @@ env:
 jobs:
   rspec:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby:
+          - 3.4
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-      - name: Install Chef
-        uses: actionshub/chef-install@main
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
         with:
-          license: ${{ vars.CHEF_LICENSE_KEY }}
-          chefDownloadUrl: chefdownload-commercial.chef.io
-          project: chef-workstation-enterprise
-          version: latest
-      - name: Run ChefSpec/RSpec unit tests
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: false
+      # `hab` must exist on disk because spec/unit/resources/cleanup_spec.rb
+      # exercises the real Helpers#hab_binary, which probes the filesystem and
+      # returns nil when there is none.
+      - name: Install chefspec and habitat for unit testing
         run: |
-          chef exec rspec
+          curl -sSfL "https://packages.chef.io/files/stable/habitat/latest/hab-x86_64-linux.tar.gz" -o "$RUNNER_TEMP/hab-x86_64-linux.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/hab-x86_64-linux.tar.gz" -C /bin --strip-components=1 --wildcards '*/hab'
+          gem install chefspec
+          hab --version
+      - name: Run RSpec
+        run: rspec --format documentation --color

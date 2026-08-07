@@ -5,7 +5,7 @@ driver:
 provisioner:
   name: chef_infra
   product_name: chef
-  product_version: 18
+  product_version: "18"
   chef_license: accept-no-persist
   attributes:
     chef_client_updater_enterprise:
@@ -19,8 +19,8 @@ platforms:
   - name: almalinux-10
   - name: opensuse-leap-15
   - name: opensuse-leap-16
-  - name: ubuntu-2404
-  - name: ubuntu-2604
+  - name: ubuntu-24.04
+  - name: ubuntu-26.04
   - name: windows-2022
     driver:
       box: stromweld/windows-2022
@@ -37,41 +37,42 @@ suites:
     verifier:
       inspec_tests:
         - test/integration/default
-      inputs:
-        expected_chef_ice_version: '19.3.15'
   - name: preserve-omnibus
     provisioner:
       named_run_list: preserve_omnibus
     verifier:
       inspec_tests:
         - test/integration/preserve-omnibus
-      inputs:
-        expected_chef_ice_version: '19.3.15'
-
   - name: remove-omnibus
     provisioner:
       named_run_list: remove_omnibus
-    # remove_omnibus defers deletion while still running under the legacy omnibus
-    # chef-client (see resources/remove_omnibus.rb); this hook performs the
-    # genuinely separate second chef-client run needed to complete the removal,
-    # invoking the cookbook's own stable binlink directly so it never resolves
-    # back to the omnibus binary. See AGENTS.md "Omnibus Removal" for the full
-    # rationale.
+    # Resource gates on not removing the omnibus if it's the currently running version of infra-client,
+    # so we need to run the chef-client converge in a separate step after the main converge using the newly
+    # installed version of chef-client to ensure the omnibus version is removed.
+    #
+    # Both variants set the license variables explicitly: a lifecycle hook opens a
+    # fresh shell on the target that inherits nothing from the kitchen host, so
+    # without them chef-client stops at an interactive "Do you accept the 1 product
+    # license?" prompt for Habitat and exits 1.
     lifecycle:
       post_converge:
-        - remote: export TEST_KITCHEN=1; export IS_KITCHEN=true; sudo -E /usr/bin/chef-client --local-mode --config /tmp/kitchen/client.rb --json-attributes /tmp/kitchen/dna.json --no-color
+        - remote: |
+            sh -c 'export TEST_KITCHEN=1; export IS_KITCHEN=true; export CHEF_LICENSE=accept-no-persist; export HAB_LICENSE=accept-no-persist; export CHEF_LICENSE_KEY="<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>"; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
           excludes:
             - windows-2022
+            - windows-2025
+            - windows-11
+            - windows-latest
         - remote: |
-            C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json --no-color
+            $env:CHEF_LICENSE='accept-no-persist'; $env:HAB_LICENSE='accept-no-persist'; $env:CHEF_LICENSE_KEY='<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>'; $env:TEST_KITCHEN='1'; $env:IS_KITCHEN='true'; C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json
           includes:
             - windows-2022
+            - windows-2025
+            - windows-11
+            - windows-latest
     verifier:
       inspec_tests:
         - test/integration/remove-omnibus
-      inputs:
-        expected_chef_ice_version: '19.3.15'
-
   - name: multi-version
     provisioner:
       named_run_list: multi_version
@@ -80,14 +81,10 @@ suites:
       inspec_tests:
         - test/integration/multi-version
       inputs:
-        expected_chef_ice_version: '19.3.15'
         older_chef_ice_version: '19.2.12'
-
   - name: scheduler-fix
     provisioner:
       named_run_list: scheduler_fix
     verifier:
       inspec_tests:
         - test/integration/scheduler-fix
-      inputs:
-        expected_chef_ice_version: '19.3.15'

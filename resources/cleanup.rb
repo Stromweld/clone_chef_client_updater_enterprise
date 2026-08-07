@@ -17,6 +17,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require 'shellwords'
+
 unified_mode true
 
 resource_name :chef_client_updater_enterprise_cleanup
@@ -25,6 +27,7 @@ provides :chef_client_updater_enterprise_cleanup
 use 'partials'
 
 property :keep_versions, Integer,
+         callbacks: { 'must be at least 1' => ->(v) { v >= 1 } },
          default: 1,
          description: 'Number of most recently installed Habitat versions to retain.'
 
@@ -85,9 +88,10 @@ action :cleanup do
       next
     end
 
-    habitat_package new_resource.habitat_package do
-      version version
-      action :remove
+    execute "remove Habitat package #{ident}" do
+      command "#{hab_binary.shellescape} pkg uninstall #{ident.shellescape}"
+      environment hab_env
+      only_if { ::File.directory?(::File.join(hab_pkg_root(new_resource.habitat_package), version, release)) }
     end
   end
 end

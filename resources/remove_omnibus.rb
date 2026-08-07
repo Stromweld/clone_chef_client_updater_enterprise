@@ -29,6 +29,7 @@ property :legacy_omnibus_package, String,
          default: 'chef'
 
 property :remove_directories, [true, false],
+         desired_state: false,
          default: true,
          description: 'Remove legacy omnibus installation directories after package uninstall.'
 
@@ -97,9 +98,28 @@ action :remove do
 
   omnibus_dir = windows? ? 'C:\\opscode\\chef' : '/opt/chef'
 
-  directory omnibus_dir do
-    recursive true
-    action :delete
-    only_if { ::Dir.exist?(omnibus_dir) }
+  if !windows? && mount_point?(omnibus_dir)
+    if ::Dir.exist?(omnibus_dir)
+      ::Dir.children(omnibus_dir).each do |entry|
+        entry_path = ::File.join(omnibus_dir, entry)
+
+        if ::File.directory?(entry_path) && !::File.symlink?(entry_path)
+          directory entry_path do
+            recursive true
+            action :delete
+          end
+        else
+          file entry_path do
+            action :delete
+          end
+        end
+      end
+    end
+  else
+    directory omnibus_dir do
+      recursive true
+      action :delete
+      only_if { ::Dir.exist?(omnibus_dir) }
+    end
   end
 end

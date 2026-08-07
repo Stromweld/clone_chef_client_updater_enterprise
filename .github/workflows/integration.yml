@@ -15,7 +15,7 @@ env:
   CHEF_LICENSE_KEY: ${{ vars.CHEF_LICENSE_KEY }}
 
 jobs:
-  integration:
+  dokken:
     env:
       KITCHEN_LOCAL_YAML: kitchen.dokken.yml
     runs-on: ubuntu-latest
@@ -48,16 +48,173 @@ jobs:
         run: |
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
       - name: Kitchen Converge again (idempotency check)
-        # multi-version deliberately installs/prunes a different Habitat version on
-        # every converge (see test/cookbooks/.../recipes/multi_version.rb) — it will
-        # never be idempotent by design, so skip the check for that suite only.
+        # A second top-level `kitchen converge` always re-bootstraps via
+        # kitchen-dokken's fixed omnibus binary (`chef_binary:
+        # /opt/chef/bin/chef-client`), regardless of what the first converge
+        # installed — so it can never validate real second-run idempotency
+        # here. Instead, this step invokes the cookbook's own stable binlink
+        # (`/usr/bin/chef-client`, resolved to confirm it's Habitat-backed)
+        # directly — exactly as the next scheduled/manual run would — and
+        # requires that single second run to be fully idempotent
+        # (`0/N resources updated`). Uniform for every suite except
+        # multi-version, which deliberately installs a different Habitat
+        # version on every converge and is never idempotent by design.
         if: matrix.suite != 'multi-version'
         run: |
-          kitchen converge ${{ matrix.suite }}-${{ matrix.os }} 2>&1 | tee /tmp/second-converge.log
-          if grep -qE '[1-9][0-9]*/[0-9]+ resources updated' /tmp/second-converge.log; then
-            echo "::error::Second converge of ${{ matrix.suite }}-${{ matrix.os }} reported resource changes — cookbook is not idempotent"
+          set -euo pipefail
+
+          instance="${{ matrix.suite }}-${{ matrix.os }}"
+          container="$(docker ps --format '{{.Names}}' | grep -m1 "${instance}$")"
+          test -n "$container" || { echo "::error::Dokken container not found for $instance"; exit 1; }
+
+          binlink=/usr/bin/chef-client
+          resolved="$(docker exec "$container" readlink -f "$binlink")"
+          case "$resolved" in
+            /hab/pkgs/chef/chef-infra-client/*/bin/chef-client) ;;
+            *) echo "::error::$binlink is not Habitat-backed: $resolved"; exit 1 ;;
+          esac
+
+          log="${RUNNER_TEMP}/idempotency-${instance}.log"
+          docker exec \
+            -e CHEF_LICENSE=accept-no-persist \
+            -e HAB_LICENSE=accept-no-persist \
+            -e CHEF_LICENSE_KEY="${{ vars.CHEF_LICENSE_KEY }}" \
+            "$container" sh -c '
+              export TEST_KITCHEN=1 IS_KITCHEN=true
+              root=/tmp/kitchen
+              [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen
+              exec /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"
+            ' >"$log" 2>&1 || { echo "::error::Habitat-backed second run of $instance failed"; cat "$log"; exit 1; }
+
+          if ! grep -qE 'Infra Phase complete, 0/[1-9][0-9]* resources updated' "$log"; then
+            echo "::error::Habitat-backed second run of $instance was not idempotent"
+            cat "$log"
             exit 1
           fi
       - name: Kitchen Verify
         run: |
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+
+  windows:
+    env:
+      KITCHEN_LOCAL_YAML: kitchen.proxy.yml
+      machine_port: 5985
+      machine_user: test_user
+      machine_pass: Pass@word1
+
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+        suite:
+          - default
+          - preserve-omnibus
+          - multi-version
+          - scheduler-fix
+          - remove-omnibus
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Install Chef
+        uses: actionshub/chef-install@main
+        with:
+          license: ${{ vars.CHEF_LICENSE_KEY }}
+          chefDownloadUrl: chefdownload-commercial.chef.io
+          project: chef-workstation-enterprise
+          version: latest
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        run: |
+          # Enable Windows long paths
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+          # Enable Git long paths
+          git config --global core.longpaths true
+      - name: Setup Machine
+        run: |
+          winrm.cmd quickconfig -q
+          net user /add ${{ env.machine_user }} ${{ env.machine_pass }}
+          net localgroup administrators ${{ env.machine_user }} /add
+      - name: Enable Windows Installer logging
+        # chef-ice installs via `msiexec /qn`, which prints nothing on failure —
+        # a 1603 reaches the Chef log with empty STDOUT/STDERR and no way to tell
+        # which custom action died. This policy key makes Windows Installer write
+        # a verbose log to %TEMP%\MSI*.LOG for every install on the box, which the
+        # "Collect Windows Installer logs" step below surfaces when a job fails.
+        # Diagnostics only — it does not affect what the cookbook does.
+        run: |
+          New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows\Installer" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx" -PropertyType String -Force | Out-Null
+      - name: Kitchen Converge
+        run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Habitat-backed second run (idempotency check)
+        # A second top-level `kitchen converge` re-bootstraps via the
+        # provisioner's own omnibus chef-client (`product_name: chef`,
+        # `product_version: "18"`) regardless of what the first converge
+        # installed, so it can never validate real second-run idempotency here.
+        # Instead — exactly like the Linux job above — invoke the cookbook's own
+        # stable binlink (`C:\hab\bin\chef-client.bat`) against the existing
+        # Kitchen sandbox, as the next scheduled run would, and require that
+        # single run to be fully idempotent (`0/N resources updated`). It goes
+        # through `kitchen exec` so it uses the same WinRM transport/account as
+        # the converge and therefore resolves the same `%TEMP%\kitchen` sandbox.
+        #
+        # `remove-omnibus` IS checked here: its `post_converge` hook has already
+        # completed the deferred omnibus removal by this point, so this run is
+        # the proof that the end state settles. `scheduler-fix` IS checked here
+        # too — on Windows the cookbook points schedules at the same
+        # `C:\hab\bin\chef-client.bat` shim Chef core's own chef_binary_path
+        # default resolves to, so the task no longer flips on every converge.
+        #
+        # Only `multi-version` is excluded: it installs a different Habitat
+        # version on every converge and is never idempotent by design (the Linux
+        # job excludes it for the same reason).
+        if: matrix.suite != 'multi-version'
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
+          $logPath = Join-Path $env:RUNNER_TEMP 'second-converge.log'
+          # `kitchen exec` opens a fresh WinRM shell on the target, which
+          # inherits NOTHING from this runner process — so the license
+          # acceptance variables must be set inside the remote command itself,
+          # exactly as the Linux job passes them via `docker exec -e`. Without
+          # them chef-client stops at an interactive "Do you accept the 1
+          # product license? [yes/No/quit]" prompt for Habitat and exits 1.
+          $prefix = "`$env:CHEF_LICENSE='accept-no-persist'; `$env:HAB_LICENSE='accept-no-persist'; `$env:CHEF_LICENSE_KEY='${{ vars.CHEF_LICENSE_KEY }}'; `$env:TEST_KITCHEN='1'; `$env:IS_KITCHEN='true'; "
+          $cmd = $prefix + 'C:\hab\bin\chef-client.bat --local-mode --config $env:TEMP\kitchen\client.rb --json-attributes $env:TEMP\kitchen\dna.json'
+          kitchen exec ${{ matrix.suite }}-${{ matrix.os }} -c $cmd 2>&1 | Tee-Object -FilePath $logPath
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Habitat-backed second run of ${{ matrix.suite }}-${{ matrix.os }} failed"
+            exit $LASTEXITCODE
+          }
+          if (-not (Select-String -Path $logPath -Pattern 'Infra Phase complete, 0/[1-9][0-9]* resources updated' -Quiet)) {
+            Write-Host "::error::Habitat-backed second run of ${{ matrix.suite }}-${{ matrix.os }} was not idempotent"
+            exit 1
+          }
+      - name: Kitchen Verify
+        run: |
+          $env:PATH = "C:\hab\bin;$env:PATH"
+          kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Collect Windows Installer logs
+        # Runs only on failure. `msiexec /qn` surfaces nothing but a numeric exit
+        # code, so without this a 1603 is undiagnosable from CI alone. Prints the
+        # custom-action and error lines from every MSI log written during the job
+        # (both the runner's own profile and the kitchen account's).
+        if: failure()
+        shell: pwsh
+        run: |
+          $dirs = @($env:TEMP, "C:\Users\${{ env.machine_user }}\AppData\Local\Temp", "C:\Windows\Temp") |
+            Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          $logs = Get-ChildItem -Path $dirs -Filter 'MSI*.LOG' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 5
+          if (-not $logs) { Write-Host 'No Windows Installer logs found.'; exit 0 }
+          foreach ($log in $logs) {
+            Write-Host "::group::$($log.FullName)"
+            Select-String -Path $log.FullName -Pattern 'CustomAction|WixQuietExec|Return value 3|Product: |Installation failed|Error \d|migrate-ice|TARGETDIR|PostInstall' |
+              Select-Object -Last 120 | ForEach-Object { $_.Line }
+            Write-Host '::endgroup::'
+          }

@@ -9,25 +9,28 @@ concurrency:
   group: lint-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  HAB_LICENSE: accept-no-persist
-  CHEF_LICENSE: accept-no-persist
-
 jobs:
   cookstyle:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby:
+          - 3.4
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      - name: Install Chef
-        uses: actionshub/chef-install@main
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
         with:
-          license: ${{ vars.CHEF_LICENSE_KEY }}
-          chefDownloadUrl: chefdownload-commercial.chef.io
-          project: chef-workstation-enterprise
-          version: latest
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: false
+      - name: Install Cookstyle
+        run: gem install cookstyle
+      - uses: r7kamura/rubocop-problem-matchers-action@v1
       - name: Cook Style
-        run: cookstyle
+        run: cookstyle --display-cop-names
+
 
   yamllint:
     runs-on: ubuntu-latest
