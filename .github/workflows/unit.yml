@@ -31,7 +31,7 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: false
-      - name: Install rspec
-        run: gem install rspec chefspec
+      - name: Install chefspec
+        run: gem install chefspec
       - name: Run RSpec
         run: rspec --format documentation --color
