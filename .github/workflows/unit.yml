@@ -15,8 +15,6 @@ env:
 
 jobs:
   rspec:
-    env:
-      BUNDLE_WITH: ${{ inputs.bundle_with }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,7 +29,11 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: false
-      - name: Install chefspec
-        run: gem install chefspec
+      - name: Install chefspec and habitat for unit testing
+        run: |
+          curl -sSfL "https://packages.chef.io/files/stable/habitat/latest/hab-x86_64-linux.tar.gz" -o "hab-x86_64-linux.tar.gz"
+          tar -xzf "hab-x86_64-linux.tar.gz" -C "/bin" --strip-components=1
+          gem install chefspec
+          hab --version
       - name: Run RSpec
         run: rspec --format documentation --color
