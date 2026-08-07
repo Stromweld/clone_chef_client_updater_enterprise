@@ -95,6 +95,141 @@ jobs:
         run: |
           kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
 
+  ubuntu:
+    env:
+      KITCHEN_LOCAL_YAML: kitchen.proxy.yml
+      machine_port: 22
+      machine_user: test_user
+      machine_pass: Pass@word1
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os:
+          - localhost
+        suite:
+          - default
+          - preserve-omnibus
+          - multi-version
+          - scheduler-fix
+          - remove-omnibus
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Install Chef
+        uses: actionshub/chef-install@main
+        with:
+          license: ${{ vars.CHEF_LICENSE_KEY }}
+          chefDownloadUrl: chefdownload-commercial.chef.io
+          project: chef-workstation-enterprise
+          version: latest
+      - name: Setup Machine
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+          sudo useradd -m -s /bin/bash ${{ env.machine_user }}
+          echo "${{ env.machine_user }}:${{ env.machine_pass }}" | sudo chpasswd
+          sudo usermod -aG sudo ${{ env.machine_user }}
+          echo "${{ env.machine_user }} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${{ env.machine_user }}
+      - name: Kitchen Converge
+        run: |
+          kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
+      - name: Habitat-backed second run (idempotency check)
+        if: matrix.suite != 'multi-version'
+        run: |
+          set -euo pipefail
+
+          instance="${{ matrix.suite }}-${{ matrix.os }}"
+          binlink=/usr/bin/chef-client
+          resolved="$(readlink -f "$binlink")"
+          case "$resolved" in
+            /hab/pkgs/chef/chef-infra-client/*/bin/chef-client) ;;
+            *) echo "::error::$binlink is not Habitat-backed: $resolved"; exit 1 ;;
+          esac
+
+          log="${RUNNER_TEMP}/idempotency-${instance}.log"
+          cmd='export CHEF_LICENSE=accept-no-persist; export HAB_LICENSE=accept-no-persist; export CHEF_LICENSE_KEY="'"${{ vars.CHEF_LICENSE_KEY }}"'"; export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
+          kitchen exec "$instance" -c "$cmd" >"$log" 2>&1 || { echo "::error::Habitat-backed second run of $instance failed"; cat "$log"; exit 1; }
+
+          if ! grep -qE 'Infra Phase complete, 0/[1-9][0-9]* resources updated' "$log"; then
+            echo "::error::Habitat-backed second run of $instance was not idempotent"
+            cat "$log"
+            exit 1
+          fi
+      - name: Kitchen Verify
+        run: |
+          kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+
+  # macos:
+  #   # chef-ice installers for macOS are not published yet (coming soon).
+  #   # This job is scaffolded now so it can be enabled with minimal changes
+  #   # once the Commercial Download API serves a mac_os_x artifact for
+  #   # chef-ice — see the "Do not add a platform..." note in AGENTS.md.
+  #   env:
+  #     KITCHEN_LOCAL_YAML: kitchen.proxy.yml
+  #     machine_port: 22
+  #     machine_user: test_user
+  #     machine_pass: Pass@word1
+  #
+  #   runs-on: macos-latest
+  #   strategy:
+  #     matrix:
+  #       os:
+  #         - localhost
+  #       suite:
+  #         - default
+  #         - preserve-omnibus
+  #         - multi-version
+  #         - scheduler-fix
+  #         - remove-omnibus
+  #     fail-fast: false
+  #
+  #   steps:
+  #     - name: Check out code
+  #       uses: actions/checkout@v7
+  #     - name: Install Chef
+  #       uses: actionshub/chef-install@main
+  #       with:
+  #         license: ${{ vars.CHEF_LICENSE_KEY }}
+  #         chefDownloadUrl: chefdownload-commercial.chef.io
+  #         project: chef-workstation-enterprise
+  #         version: latest
+  #     - name: Setup Machine
+  #       run: |
+  #         sudo systemsetup -setremotelogin on
+  #         sudo sysadminctl -addUser ${{ env.machine_user }} -password ${{ env.machine_pass }} -admin
+  #     - name: Kitchen Converge
+  #       run: |
+  #         kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
+  #     - name: Habitat-backed second run (idempotency check)
+  #       if: matrix.suite != 'multi-version'
+  #       run: |
+  #         set -euo pipefail
+  #
+  #         instance="${{ matrix.suite }}-${{ matrix.os }}"
+  #         binlink=/usr/local/bin/chef-client
+  #         resolved="$(readlink -f "$binlink")"
+  #         case "$resolved" in
+  #           /hab/pkgs/chef/chef-infra-client/*/bin/chef-client) ;;
+  #           *) echo "::error::$binlink is not Habitat-backed: $resolved"; exit 1 ;;
+  #         esac
+  #
+  #         log="${RUNNER_TEMP}/idempotency-${instance}.log"
+  #         cmd='export CHEF_LICENSE=accept-no-persist; export HAB_LICENSE=accept-no-persist; export CHEF_LICENSE_KEY="'"${{ vars.CHEF_LICENSE_KEY }}"'"; export TEST_KITCHEN=1; export IS_KITCHEN=true; root=/tmp/kitchen; [ -f /opt/kitchen/client.rb ] && root=/opt/kitchen; /usr/local/bin/chef-client --local-mode --config "$root/client.rb" --json-attributes "$root/dna.json"'
+  #         kitchen exec "$instance" -c "$cmd" >"$log" 2>&1 || { echo "::error::Habitat-backed second run of $instance failed"; cat "$log"; exit 1; }
+  #
+  #         if ! grep -qE 'Infra Phase complete, 0/[1-9][0-9]* resources updated' "$log"; then
+  #           echo "::error::Habitat-backed second run of $instance was not idempotent"
+  #           cat "$log"
+  #           exit 1
+  #         fi
+  #     - name: Kitchen Verify
+  #       run: |
+  #         kitchen verify ${{ matrix.suite }}-${{ matrix.os }}
+
   windows:
     env:
       KITCHEN_LOCAL_YAML: kitchen.proxy.yml
