@@ -600,7 +600,7 @@ action :install do
       "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore " \
         "--license-key #{license}#{preserve_flag}#{fresh_flag}#{fstab_flag}"
     }
-    environment lazy { { 'CHEF_LICENSE_KEY' => license.to_s } }
+    environment lazy { hab_env.merge('CHEF_LICENSE_KEY' => license.to_s) }
     sensitive true
     only_if { ::File.exist?('/hab/migration/bin/migrate-ice') }
     only_if { ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').any? }

@@ -347,6 +347,25 @@ describe 'chef_client_updater_enterprise_install' do
         :preserve_omnibus, :fstab_handling
       )
     end
+
+    # migrate-ice is itself a Habitat binary and gates on the interactive Habitat
+    # license prompt when HAB_LICENSE is unset. execute's `environment` REPLACES
+    # the child process's env rather than merging with the parent's, so omitting
+    # HAB_LICENSE here (as opposed to binlinks.rb/cleanup.rb, which both pass
+    # `environment hab_env`) hangs any CI converge that actually needs to run it.
+    it 'passes HAB_LICENSE alongside CHEF_LICENSE_KEY to migrate-ice, since environment replaces rather than merges with the parent env' do
+      run = converge_with do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          download_url 'https://example.invalid/chef-ice.deb'
+          license_key 'abc123'
+          manage_binlinks false
+          update_scheduler_resources false
+        end
+      end
+      resource = run.find_resource(:execute, 'migrate-ice apply airgap')
+
+      expect(resource.environment).to include('HAB_LICENSE' => 'accept-no-persist', 'CHEF_LICENSE_KEY' => 'abc123')
+    end
   end
 
   # execute[migrate-ice apply airgap] is guarded by only_if on
