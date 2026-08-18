@@ -28,34 +28,6 @@ default_action :reconverge
 
 action_class do
   include ChefClientUpdaterEnterprise::Helpers
-
-  # chef_client_cron/launchd/systemd_timer/scheduled_task's chef_binary_path default varies by
-  # Chef Infra Client version: newer releases (e.g. what chef-ice itself ships) default it to a
-  # lazy, hab-aware `chef_client_hab_binary_path` block.
-  #
-  # Idempotent: a resource whose chef_binary_path already equals resolved_binary_path is left
-  # untouched entirely — neither the property nor its action(s) are re-run — so a steady-state
-  # converge (this resource fired but nothing actually changed) reports zero updated resources,
-  # same as every other resource in this cookbook.
-  def reconverge_scheduler_resources(resource_collection, resolved_binary_path)
-    scheduler_types = %i(chef_client_scheduled_task chef_client_cron chef_client_launchd chef_client_systemd_timer)
-    found = resource_collection.all_resources.select { |r| scheduler_types.include?(r.resource_name) }
-
-    if found.empty?
-      Chef::Log.debug('chef_client_updater_enterprise: no chef-client scheduler resources found to reconverge.')
-      return
-    end
-
-    found.each do |resource|
-      next unless resource.respond_to?(:chef_binary_path)
-      next if resource.chef_binary_path == resolved_binary_path
-
-      Chef::Log.info("chef_client_updater_enterprise: reconverging #{resource} for the newly installed binary at #{resolved_binary_path}.")
-      resource.chef_binary_path(resolved_binary_path)
-      resource.action.each { |a| resource.run_action(a) }
-      new_resource.updated_by_last_action(true)
-    end
-  end
 end
 
 action :reconverge do
@@ -72,5 +44,21 @@ action :reconverge do
   return unless ::File.exist?(resolved_binary_path)
 
   resource_collection = run_context.root_run_context.resource_collection
-  reconverge_scheduler_resources(resource_collection, resolved_binary_path)
+  scheduler_types = %i(chef_client_scheduled_task chef_client_cron chef_client_launchd chef_client_systemd_timer)
+  found = resource_collection.all_resources.select { |r| scheduler_types.include?(r.resource_name) }
+
+  if found.empty?
+    Chef::Log.debug('chef_client_updater_enterprise: no chef-client scheduler resources found to reconverge.')
+    return
+  end
+
+  found.each do |resource|
+    next unless resource.respond_to?(:chef_binary_path)
+    next if resource.chef_binary_path == resolved_binary_path
+
+    Chef::Log.info("chef_client_updater_enterprise: reconverging #{resource} for the newly installed binary at #{resolved_binary_path}.")
+    resource.chef_binary_path(resolved_binary_path)
+    resource.action.each { |a| resource.run_action(a) }
+    new_resource.updated_by_last_action(true)
+  end
 end

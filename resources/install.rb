@@ -111,18 +111,16 @@ default_action :install
 action_class do
   include ChefClientUpdaterEnterprise::Helpers
 
-  def validate_license!
+  # Resolves the artifact's download URL, sha256 and concrete version via Chef's
+  # Commercial Download API. Returns a Hash with 'url', 'sha256' and 'version'.
+  def artifact_info
     if new_resource.license_key.nil? || new_resource.license_key.to_s.strip.empty?
       raise Chef::Exceptions::ConfigurationError,
             'chef_client_updater_enterprise_install: license_key is required. ' \
             "Set the CHEF_LICENSE_KEY environment variable or pass `license_key 'YOUR_KEY'` " \
             'to the resource. A valid license key is required to download chef-ice packages.'
     end
-  end
 
-  # Resolves the artifact's download URL, sha256 and concrete version via Chef's
-  # Commercial Download API. Returns a Hash with 'url', 'sha256' and 'version'.
-  def artifact_info
     api_platform, api_platform_version = download_api_platform_info
 
     commercial_artifact_metadata(
@@ -149,30 +147,29 @@ action_class do
           "#{url.to_s.split('?').first} — the URL's path must end in one of " \
           "#{ChefClientUpdaterEnterprise::Helpers::PACKAGE_EXTENSIONS.map { |e| ".#{e}" }.join(', ')}."
   end
-
-  # Declares (or re-runs) the chef_client_updater_enterprise_scheduler_reconvergence resource for
-  # new_resource's habitat_package/version, when update_scheduler_resources is enabled. That
-  # resource's own :reconverge action handles resolving the installed binary path and repointing
-  # any chef_client_cron/launchd/systemd_timer/scheduled_task resources found in the collection.
-  def reconverge_installed_scheduler_resources(new_resource)
-    return unless new_resource.update_scheduler_resources
-
-    chef_client_updater_enterprise_scheduler_reconvergence 'default' do
-      habitat_package new_resource.habitat_package
-      version new_resource.version
-      action :reconverge
-    end
-  end
 end
 
 action :install do
+  # return early if the requested version is already installed
   unless new_resource.version == 'latest'
     installed = current_installed_version(new_resource.product_name, new_resource.habitat_package)
     if installed == new_resource.version
       Chef::Log.debug("chef_client_updater_enterprise_install: #{new_resource.product_name} #{new_resource.version} already installed, skipping.")
-      reconverge_installed_scheduler_resources(new_resource)
       return
     end
+  end
+
+  # Declares the chef_client_updater_enterprise_scheduler_reconvergence resource up front so later
+  # `notifies` calls have something to target. This resource repoints any
+  # chef_client_scheduled_task/chef_client_cron/chef_client_launchd/chef_client_systemd_timer resource
+  # in the run's resource collection at the chef-ice version this converge just installed, so the next
+  # SCHEDULED run uses the new client instead of whatever binary the schedule was originally written
+  # against.
+  chef_client_updater_enterprise_scheduler_reconvergence 'default' do
+    habitat_package new_resource.habitat_package
+    version new_resource.version
+    action :nothing
+    only_if { new_resource.update_scheduler_resources }
   end
 
   if new_resource.download_url
@@ -186,9 +183,7 @@ action :install do
     # resource's own source-file inspection is the only idempotency signal available.
     pkg_version = new_resource.version == 'latest' ? nil : new_resource.version
   else
-    # Commercial Download API path
-    validate_license!
-
+    # Commercial Download API path — license validation happens inside artifact_info
     artifact = artifact_info
     raise "No artifact found for #{new_resource.product_name} #{new_resource.version}" if artifact.nil?
 
@@ -527,14 +522,14 @@ action :install do
       timeout 1800
       notifies :create, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :before
       notifies :delete, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :delayed
-      notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
+      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
     end
   else
     package new_resource.product_name do
       source pkg_path
       version pkg_version if pkg_version
       action pkg_action
-      notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
+      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
     end
   end
 
@@ -612,7 +607,7 @@ action :install do
     retries 5
     retry_delay 10
     not_if { pkg_version && hab_pkg_dirs(new_resource.habitat_package).any? { |d| d.split('/')[-2] == pkg_version } }
-    notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed
+    notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
   end
 
   unless windows? || hab_binary
@@ -627,16 +622,6 @@ action :install do
       link_type :symbolic
       only_if { hab_pkg_dirs('chef/hab').any? || hab_pkg_dirs('core/hab').any? }
     end
-  end
-
-  # Repoint any chef_client_scheduled_task/chef_client_cron/chef_client_launchd/
-  # chef_client_systemd_timer resource in the run's resource collection at the
-  # chef-ice version this converge just installed, so the next SCHEDULED run uses
-  # the new client instead of whatever binary the schedule was originally written
-  # against.
-  ruby_block 'reconverge installed scheduler resources' do
-    block { reconverge_installed_scheduler_resources(new_resource) }
-    action :nothing
   end
 
   if new_resource.manage_binlinks

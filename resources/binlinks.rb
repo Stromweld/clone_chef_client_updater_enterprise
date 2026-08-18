@@ -41,18 +41,13 @@ action_class do
     if new_resource.version == 'latest'
       target_dir = dirs.last
     else
-      target_dir = dirs.select { |d| d.include?("/#{new_resource.version}/") }.last
+      target_dir = dirs.select { |d| hab_dir_version(d) == new_resource.version }.last
       raise Chef::Exceptions::ValidationFailed,
             "chef_client_updater_enterprise_binlinks: Requested version '#{new_resource.version}' " \
             "not found in Habitat package store. Installed dirs: #{dirs.join(', ')}" unless target_dir
     end
 
-    root = hab_pkg_root(new_resource.habitat_package)
-    rel = target_dir.delete_prefix("#{root}/")
-    parts = rel.split('/')
-    return unless parts.length >= 2
-
-    "#{new_resource.habitat_package}/#{parts.first}/#{parts[1]}"
+    hab_ident_for_dir(new_resource.habitat_package, target_dir)
   end
 
   # Directory `hab pkg binlink` is told (via --dest) to create the symlink/shim in.
@@ -61,15 +56,10 @@ action_class do
   # cookbook's documented binlink locations (notably `/bin` on Linux, not `/usr/bin`).
   # Relying on hab's default would silently binlink to the wrong directory.
   #
-  # Delegates to ChefClientUpdaterEnterprise::Helpers so chef_client_updater_enterprise_install's
-  # scheduler resource reconvergence stays in agreement with this path.
-  def link_dir
-    chef_client_binlink_dir
-  end
-
-  def link_dest
-    chef_client_binlink_path
-  end
+  # link_dir/link_dest were previously trivial one-line wrappers around
+  # chef_client_binlink_dir/chef_client_binlink_path with no behavior of their own;
+  # call the Helpers methods directly instead (mixed in above via `include
+  # ChefClientUpdaterEnterprise::Helpers`).
 
   # True when `dest` is already a symlink pointing into the resolved package's
   # install directory. Used to make the binlink `execute` resource idempotent —
@@ -99,7 +89,7 @@ end
 
 action :create do
   unless windows?
-    dest = link_dest
+    dest = chef_client_binlink_path
 
     # Only remove a pre-existing stale destination when it is a *non-symlink* file
     # (e.g. an old omnibus binary at /usr/bin/chef-client). `hab pkg binlink --force`
@@ -122,7 +112,7 @@ action :create do
         raise Chef::Exceptions::ValidationFailed,
               'chef_client_updater_enterprise_binlinks: No installed Habitat package found.' unless ident
 
-        "#{hab_binary} pkg binlink --force --dest #{link_dir} #{ident} chef-client"
+        "#{hab_binary} pkg binlink --force --dest #{chef_client_binlink_dir} #{ident} chef-client"
       }
       environment hab_env
       not_if { hab_pkg_dirs(new_resource.habitat_package).empty? }
@@ -144,7 +134,7 @@ action :create do
       }
       environment hab_env
       not_if { hab_pkg_dirs(new_resource.habitat_package).empty? }
-      not_if { binlink_current_windows?(link_dest, resolved_ident) }
+      not_if { binlink_current_windows?(chef_client_binlink_path, resolved_ident) }
     end
 
     windows_path 'C:\hab\bin' do
@@ -168,7 +158,7 @@ action :create do
 end
 
 action :remove do
-  dest = link_dest
+  dest = chef_client_binlink_path
 
   file dest do
     action :delete
