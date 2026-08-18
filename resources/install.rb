@@ -150,40 +150,18 @@ action_class do
           "#{ChefClientUpdaterEnterprise::Helpers::PACKAGE_EXTENSIONS.map { |e| ".#{e}" }.join(', ')}."
   end
 
-  # chef_client_cron/launchd/systemd_timer/scheduled_task's chef_binary_path default varies by
-  # Chef Infra Client version: newer releases (e.g. what chef-ice itself ships) default it to a
-  # lazy, hab-aware `chef_client_hab_binary_path` block.
-  def reconverge_scheduler_resources(resource_collection, resolved_binary_path)
-    scheduler_types = %i(chef_client_scheduled_task chef_client_cron chef_client_launchd chef_client_systemd_timer)
-    found = resource_collection.all_resources.select { |r| scheduler_types.include?(r.resource_name) }
-
-    if found.empty?
-      Chef::Log.debug('chef_client_updater_enterprise: no chef-client scheduler resources found to reconverge.')
-      return
-    end
-
-    found.each do |resource|
-      Chef::Log.info("chef_client_updater_enterprise: reconverging #{resource} for the newly installed binary at #{resolved_binary_path}.")
-      resource.chef_binary_path(resolved_binary_path) if resource.respond_to?(:chef_binary_path)
-      resource.action.each { |a| resource.run_action(a) }
-    end
-  end
-
+  # Declares (or re-runs) the chef_client_updater_enterprise_scheduler_reconvergence resource for
+  # new_resource's habitat_package/version, when update_scheduler_resources is enabled. That
+  # resource's own :reconverge action handles resolving the installed binary path and repointing
+  # any chef_client_cron/launchd/systemd_timer/scheduled_task resources found in the collection.
   def reconverge_installed_scheduler_resources(new_resource)
-    resolved_binary_path = chef_client_hab_binary_path(new_resource.habitat_package, new_resource.version)
-    update_scheduler_enabled = new_resource.update_scheduler_resources
-    resource_collection = run_context.root_run_context.resource_collection
+    return unless new_resource.update_scheduler_resources
 
-    if update_scheduler_enabled && resolved_binary_path.nil?
-      Chef::Log.warn(
-        'chef_client_updater_enterprise: update_scheduler_resources is true but no installed ' \
-        "#{new_resource.habitat_package} Habitat package was found to resolve a chef_binary_path from."
-      )
+    chef_client_updater_enterprise_scheduler_reconvergence 'default' do
+      habitat_package new_resource.habitat_package
+      version new_resource.version
+      action :reconverge
     end
-
-    return unless update_scheduler_enabled && resolved_binary_path && ::File.exist?(resolved_binary_path)
-
-    reconverge_scheduler_resources(resource_collection, resolved_binary_path)
   end
 end
 

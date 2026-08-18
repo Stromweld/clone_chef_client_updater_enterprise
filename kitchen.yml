@@ -88,3 +88,9 @@ suites:
     verifier:
       inspec_tests:
         - test/integration/scheduler-fix
+  - name: scheduler-reconvergence
+    provisioner:
+      named_run_list: scheduler_reconvergence
+    verifier:
+      inspec_tests:
+        - test/integration/scheduler-reconvergence
