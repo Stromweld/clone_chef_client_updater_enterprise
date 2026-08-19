@@ -7,6 +7,21 @@ driver:
   username: <%= ENV["machine_user"] %>
   password: <%= ENV["machine_pass"] %>
 
+# The proxy driver's own host/port/username/password (above) are injected into
+# the transport only by Kitchen::Driver::SSHBase#backcompat_merged_state, which
+# runs on the converge/verify path. `kitchen exec` (used by the CI "Habitat-
+# backed second run" idempotency check) and lifecycle `remote:` hooks are NOT:
+# both call instance.transport.connection directly with the raw state file, so
+# an unconfigured ssh transport gets password: nil and either dies outright or
+# — worse, on a non-TTY CI runner — crashes trying to interactively prompt for
+# one (Errno::ENOTTY). Configure the (default ssh) transport explicitly here so
+# every path has credentials; the windows-latest platform below does the same
+# for winrm.
+transport:
+  username: <%= ENV["machine_user"] %>
+  password: <%= ENV["machine_pass"] %>
+  port: <%= ENV["machine_port"] %>
+
 platforms:
   - name: localhost
   - name: windows-latest
@@ -66,16 +81,3 @@ platforms:
               if ($p.ExitCode -ne 0) { throw "omnibus Chef install failed with exit code $($p.ExitCode)" }
               Write-Host "installed omnibus Chef Infra Client $($meta.version)"
             }
-    # The proxy driver's own host/port/username/password (above) are injected
-    # into the transport only by Kitchen::Driver::SSHBase#backcompat_merged_state,
-    # which is on the converge/verify path. Lifecycle hooks are NOT:
-    # Kitchen::LifecycleHook::Remote#run calls instance.transport.connection
-    # directly with the raw state file, so an unconfigured winrm transport gets
-    # password: nil and dies with "password is a required option" before the
-    # remove-omnibus suite's post_converge hook can run. Configure the transport
-    # explicitly so both paths have credentials.
-    transport:
-      name: winrm
-      username: <%= ENV["machine_user"] %>
-      password: <%= ENV["machine_pass"] %>
-      port: <%= ENV["machine_port"] %>
