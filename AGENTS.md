@@ -191,6 +191,20 @@ and preserves the legacy omnibus install when `preserve_omnibus` is true.
 - **Debian family** — `dpkg --unpack` then `dpkg --configure`, temporarily stubbing `migrate-ice`
   (and, on upgrades, the previous package's `postrm`, which can `rm -rf /hab`) between the phases;
   `dpkg -i` has no `--noscripts`. See below.
+
+  **`dpkg --unpack` uses `--force-conflicts`.** chef-ice's `.deb` declares `Conflicts:
+  chef-workstation`, so a bare `dpkg --unpack` refuses to unpack it on any box already carrying any
+  chef-workstation variant — including CI runners bootstrapped with chef-workstation-enterprise
+  purely to get `kitchen`/`inspec` tooling (`dpkg: ... conflicting packages - not installing
+  chef-ice`). This conflict declaration is considered overly broad for this cookbook's purposes, not
+  an actual incompatibility: chef-ice's payload lives entirely under `/hab`, so it and
+  chef-workstation are expected to coexist side-by-side. `--force-conflicts` is a deliberate override
+  of that check, verified via `spec/unit/resources/install_spec.rb`'s "Debian-family platforms"
+  context. **RPM is not (yet) patched the same way** — no current CI job exercises `rpm_package` on
+  a chef-workstation-bootstrapped host, so an analogous RPM `Conflicts:` failure (which would need
+  `--nodeps`, since neither `--replacefiles`, `--noscripts` nor `--nodigest` override it) has not been
+  confirmed live. Fix RPM only once it actually fails the same way — don't preemptively add
+  `--nodeps` without reproducing the failure first.
 - **Windows** — `windows_package` (`installer_type :msi`). Each release has a distinct MSI
   `ProductCode`/`UpgradeCode`, so side-by-side is already safe; only the `CHEF_PRESERVE_OMNIBUS=1`
   MSI property is needed (forwarded to migrate-ice by the package's `PostInstall.ps1`, present only

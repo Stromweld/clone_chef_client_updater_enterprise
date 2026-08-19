@@ -238,6 +238,36 @@ describe 'chef_client_updater_enterprise_install' do
     end
   end
 
+  # Regression coverage: chef-ice's .deb declares `Conflicts: chef-workstation`, so a
+  # plain `dpkg --unpack` refuses to unpack it on any box that already has any
+  # chef-workstation variant installed — including CI runners that bootstrap via
+  # chef-workstation-enterprise purely to get kitchen/inspec tooling (dpkg: "conflicting
+  # packages - not installing chef-ice"). --force-conflicts overrides that declaration;
+  # this cookbook considers it overly broad rather than an actual incompatibility, since
+  # chef-ice and chef-workstation are expected to coexist side-by-side under Habitat.
+  context 'installing chef-ice on Debian-family platforms' do
+    it 'unpacks with --force-conflicts to override the chef-workstation package conflict' do
+      stub_not_installed
+
+      run = converge_resource(platform: 'ubuntu', version: '24.04') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          version '19.3.15'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1_amd64.deb'
+          checksum 'fe004919ddbf171947c6a59d9bd5d516a61ff30e64cf6e4ddd95521b90cc80af'
+          manage_binlinks false
+          update_scheduler_resources false
+        end
+      end
+
+      unpack = run.resource_collection.all_resources.find do |r|
+        r.resource_name == :execute && r.name.start_with?('dpkg --unpack')
+      end
+
+      expect(unpack).to_not be_nil
+      expect(unpack.command).to include('--force-conflicts')
+    end
+  end
+
   # `version` is compared against the literal string 'latest' in resources/install.rb,
   # resources/binlinks.rb and Helpers#chef_client_hab_binary_path. Before the shared
   # property gained a coerce, install.rb's case-sensitive `== 'latest'` disagreed with

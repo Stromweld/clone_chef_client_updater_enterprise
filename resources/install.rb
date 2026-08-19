@@ -391,8 +391,11 @@ action :install do
       not_if { dpkg_already_current }
     end
 
+    # --force-conflicts overrides dpkg's declared `Conflicts: chef-workstation-enterprise`
+    # (chef-ice's .deb refuses to unpack at all otherwise when any variant of
+    # chef-workstation-enterprise is present).
     execute "dpkg --unpack #{pkg_path}" do
-      command "dpkg --unpack #{pkg_path}"
+      command "dpkg --force-conflicts --unpack #{pkg_path}"
       not_if { dpkg_already_current }
     end
 
