@@ -37,7 +37,7 @@ platforms:
               url="$(echo "$meta" | grep -o '"url":"[^"]*"' | cut -d'"' -f4)"
               deb=/tmp/chef-omnibus-18.deb
               curl -fsSL -o "$deb" "$url"
-              sudo dpkg -i "$deb"
+              sudo dpkg -i --force-conflicts "$deb"
               echo "installed omnibus Chef Infra Client"
             fi
   - name: windows-latest
