@@ -24,44 +24,23 @@ transport:
 
 platforms:
   - name: localhost
+    lifecycle:
+      pre_converge:
+        - remote: |
+            if [ -x /opt/chef/bin/chef-client ]; then
+              echo 'omnibus Chef Infra Client already present, skipping'
+            else
+              set -euo pipefail
+              key='<%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>'
+              uri="https://chefdownload-commercial.chef.io/stable/chef/metadata?p=ubuntu&pv=24.04&m=x86_64&v=18&direct=true&license_id=$key"
+              meta="$(curl -fsSL "$uri")"
+              url="$(echo "$meta" | grep -o '"url":"[^"]*"' | cut -d'"' -f4)"
+              deb=/tmp/chef-omnibus-18.deb
+              curl -fsSL -o "$deb" "$url"
+              sudo dpkg -i "$deb"
+              echo "installed omnibus Chef Infra Client"
+            fi
   - name: windows-latest
-    # This platform is the GitHub Actions runner itself, which already has
-    # chef-workstation-enterprise installed under C:\hab — unlike the Vagrant
-    # and EC2 drivers, whose boxes are bare and therefore always get omnibus
-    # Chef at C:\opscode\chef as part of the converge. Two suites broke on that
-    # one difference:
-    #
-    #   - multi-version: with no omnibus present, Kitchen resolved chef-client
-    #     out of C:\hab (see the search order below), so the converging process
-    #     itself held C:\hab\pkgs\core\zlib\...\zlibwapi.dll open. migrate-ice
-    #     unpacks the chef-ice bundle *into* C:\hab and hit that exact file —
-    #     "The process cannot access the file because it is being used by
-    #     another process" — then rolled back and returned 1603.
-    #   - preserve-omnibus: with no omnibus install ever created, its
-    #     C:\opscode\chef assertion could not pass, and remove-omnibus was
-    #     passing vacuously for the same reason.
-    #
-    # Kitchen::Provisioner::ChefInfra#find_chef_executable searches, in order:
-    #   1. config[:chef_client_path]  (defaults to C:\opscode\chef\bin\chef-client.bat)
-    #   2. C:\hab\chef\bin\chef-client.ps1
-    #   3. C:\hab\pkgs\chef\chef-infra-client\*\*\bin\chef-client.bat
-    #   4. C:\opscode\chef\bin\chef-client.bat
-    # Note 3 precedes 4, so an omnibus install only wins via 1 — which it does,
-    # since that is the default. Simply making omnibus *exist* is therefore
-    # enough to restore parity; it does not need install_strategy: always
-    # (which would also reinstall it on every converge).
-    #
-    # This hook is what creates it. It is idempotent, so the second converge in
-    # a `kitchen test` is unaffected, and it is scoped to this platform so it
-    # cannot disturb the Vagrant/EC2/Dokken drivers.
-    #
-    # chef_client_path is pinned rather than left to its default, which is built
-    # from config[:chef_omnibus_root] — a value only assigned as a side effect of
-    # generating the install command (`config[:chef_omnibus_root] = installer.root`
-    # in ChefBase#install_script_contents). Until that runs it is empty, and the
-    # default collapses to "\bin\chef-client.bat", which resolves nowhere and
-    # silently drops the search back to the C:\hab entry this is meant to avoid.
-    # Pinning it makes step 1 deterministic.
     provisioner:
       chef_client_path: C:\opscode\chef\bin\chef-client.bat
     lifecycle:
