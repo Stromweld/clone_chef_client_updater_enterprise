@@ -10,6 +10,7 @@ provisioner:
   attributes:
     chef_client_updater_enterprise:
       license_key: <%= ENV.fetch('CHEF_LICENSE_KEY', nil) %>
+  sudo_command: sudo -E env HAB_LICENSE=accept-no-persist CHEF_LICENSE=accept-no-persist
 
 verifier:
   name: inspec

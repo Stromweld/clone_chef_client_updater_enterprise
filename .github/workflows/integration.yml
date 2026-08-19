@@ -136,8 +136,6 @@ jobs:
           echo "${{ env.machine_user }}:${{ env.machine_pass }}" | sudo chpasswd
           sudo usermod -aG sudo ${{ env.machine_user }}
           echo "${{ env.machine_user }} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${{ env.machine_user }}
-          hab license accept
-          chef --chef-license accept
       - name: Kitchen Converge
         run: |
           kitchen converge ${{ matrix.suite }}-${{ matrix.os }}
