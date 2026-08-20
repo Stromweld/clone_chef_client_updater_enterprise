@@ -431,6 +431,37 @@ describe 'chef_client_updater_enterprise_install' do
       expect(notification).to_not be_nil
       expect(notification.action).to eq(:reconverge)
     end
+
+    # migrate-ice apply airgap's own not_if can already be satisfied on a converge
+    # that just installed a new chef-ice via dpkg (e.g. the Habitat package was
+    # pre-populated by something else, like a chef-workstation bootstrap sharing
+    # /hab/pkgs). Since it was the only Debian-path resource wired to reconverge,
+    # that left a genuine dpkg-level install with no notification at all. The
+    # dpkg --configure ruby_block runs the actual install/upgrade and has its own
+    # independent not_if (dpkg_already_current), so it must carry the notification
+    # too.
+    it 'notifies reconvergence from the dpkg --configure ruby_block on Debian' do
+      stub_not_installed
+
+      run = converge_resource(platform: 'ubuntu', version: '24.04') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          version '19.3.15'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1_amd64.deb'
+          checksum 'a' * 64
+        end
+      end
+
+      configure_block = run.resource_collection.all_resources.find do |r|
+        r.resource_name == :ruby_block && r.name.start_with?('dpkg --configure')
+      end
+
+      notification = configure_block.delayed_notifications.find do |n|
+        n.resource.to_s == 'chef_client_updater_enterprise_scheduler_reconvergence[default]'
+      end
+
+      expect(notification).to_not be_nil
+      expect(notification.action).to eq(:reconverge)
+    end
   end
 
   # chef-ice MSIs older than 19.3.15 carry no SetTARGETDIR custom action, so

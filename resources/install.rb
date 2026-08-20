@@ -423,6 +423,7 @@ action :install do
         end
       end
       not_if { dpkg_already_current }
+      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
     end
   elsif windows?
     # Unlike rpm/deb, chef-ice's Windows MSI has no `--noscripts`-equivalent
