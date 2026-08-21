@@ -12,6 +12,7 @@ Chef Infra Client >= 17.0 (required for the `use` partial DSL).
 - [chef_client_updater_enterprise_binlinks](documentation/resources/binlinks.md)
 - [chef_client_updater_enterprise_cleanup](documentation/resources/cleanup.md)
 - [chef_client_updater_enterprise_remove_omnibus](documentation/resources/remove_omnibus.md)
+- [chef_client_updater_enterprise_scheduler_reconvergence](documentation/resources/scheduler_reconvergence.md)
 
 ## Usage
 

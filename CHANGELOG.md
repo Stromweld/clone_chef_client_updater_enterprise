@@ -2,6 +2,11 @@
 
 This file is used to list changes made in each version of the chef_client_updater_enterprise cookbook.
 
+## 0.3.0 (2026-08-17)
+
+- added scheduler_reconvergence resource
+- code cleanup/simplification
+
 ## 0.2.0 (2026-08-06)
 
 - removed use of mixlib-install

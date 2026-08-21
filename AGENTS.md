@@ -108,7 +108,8 @@ which is why the downloading `remote_file` stays `sensitive true`.
 **`license_key` is typed `[String, NilClass]`, not `String`.** Its default resolves to nil when
 `CHEF_LICENSE_KEY` is unset, and the `download_url` path legitimately needs no key — with a bare
 `String` type, merely READING the property raised `Chef::Exceptions::ValidationFailed` and broke the
-airgapped/local-mirror workflow. Callers needing a key go through `validate_license!`.
+airgapped/local-mirror workflow. Callers needing a key go through `artifact_info`, which validates
+before calling the Commercial Download API.
 
 ### CDN Propagation — Both `retries` and `verify` Are Required
 
@@ -190,6 +191,20 @@ and preserves the legacy omnibus install when `preserve_omnibus` is true.
 - **Debian family** — `dpkg --unpack` then `dpkg --configure`, temporarily stubbing `migrate-ice`
   (and, on upgrades, the previous package's `postrm`, which can `rm -rf /hab`) between the phases;
   `dpkg -i` has no `--noscripts`. See below.
+
+  **`dpkg --unpack` uses `--force-conflicts`.** chef-ice's `.deb` declares `Conflicts:
+  chef-workstation`, so a bare `dpkg --unpack` refuses to unpack it on any box already carrying any
+  chef-workstation variant — including CI runners bootstrapped with chef-workstation-enterprise
+  purely to get `kitchen`/`inspec` tooling (`dpkg: ... conflicting packages - not installing
+  chef-ice`). This conflict declaration is considered overly broad for this cookbook's purposes, not
+  an actual incompatibility: chef-ice's payload lives entirely under `/hab`, so it and
+  chef-workstation are expected to coexist side-by-side. `--force-conflicts` is a deliberate override
+  of that check, verified via `spec/unit/resources/install_spec.rb`'s "Debian-family platforms"
+  context. **RPM is not (yet) patched the same way** — no current CI job exercises `rpm_package` on
+  a chef-workstation-bootstrapped host, so an analogous RPM `Conflicts:` failure (which would need
+  `--nodeps`, since neither `--replacefiles`, `--noscripts` nor `--nodigest` override it) has not been
+  confirmed live. Fix RPM only once it actually fails the same way — don't preemptively add
+  `--nodeps` without reproducing the failure first.
 - **Windows** — `windows_package` (`installer_type :msi`). Each release has a distinct MSI
   `ProductCode`/`UpgradeCode`, so side-by-side is already safe; only the `CHEF_PRESERVE_OMNIBUS=1`
   MSI property is needed (forwarded to migrate-ice by the package's `PostInstall.ps1`, present only
@@ -409,24 +424,19 @@ converge". `migrate-ice apply airgap`'s `not_if` is satisfied once `pkg_version`
 `execute` is guarded by `only_if { ::File.exist?('/hab/migration/bin/migrate-ice') }`, a Linux-only
 path — on Windows the MSI's embedded `PostInstall.ps1` invokes migrate-ice inside the msiexec
 transaction instead. So the `windows_package` and the generic non-RHEL/non-Debian `package` fallback
-carry the same `notifies :run, 'ruby_block[reconverge installed scheduler resources]', :delayed`.
+carry the same `notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed`.
 Both are natively idempotent, so they notify only on a real install. Chef de-duplicates delayed
 notifications by resource+action, so a platform where both fire still reconverges once. Without the
 Windows notification a `chef_client_scheduled_task` is never repointed.
 
-Do not switch the block to unconditional `action :run`. `Chef::Provider::RubyBlock` wraps the call
-in an unconditional `converge_by` and discards the return value, so it would report a changed
-resource on every converge forever and break the CI converge-twice check. For the same reason
-`reconverge_scheduler_resources` computes no updated-or-not return value; nothing could consume one.
-
-This is not a general repair mechanism for a `chef_binary_path` that drifted for unrelated reasons.
-The only other entry point is the early return at the top of `action :install` (explicitly pinned
-version already installed), which calls `reconverge_installed_scheduler_resources` directly in Ruby
-because it returns before the `ruby_block` is declared.
-
-**History**: an earlier design used `Kernel.exec`/`exit(213)` handoff, which deadlocked on Windows
-(MRI's `Kernel.exec` can't truly replace a process there, so the parent stayed alive holding Chef's
-run-lock). In-place reconvergence avoids the run-lock and needs no second chef-client run.
+The `chef_client_updater_enterprise_scheduler_reconvergence 'default'` resource itself is declared
+once, near the top of `action :install`, as `action :nothing` guarded by
+`only_if { new_resource.update_scheduler_resources }` — it performs no work on its own and exists
+purely as a notification target. This makes the gating exact and symmetric: reconvergence fires
+if and only if BOTH (a) `update_scheduler_resources` is true (the `only_if`) AND (b) some resource
+this converge notifies it `:delayed` because ITS OWN idempotency check reported a real change (an
+actual install/upgrade happened). Neither condition alone is sufficient, and no code path declares
+or runs it any other way.
 
 **Without reconvergence** (`update_scheduler_resources false`), a scheduler resource declared before
 chef-ice is binlinked bakes in a stale path permanently. Separately, `cleanup` only excludes the

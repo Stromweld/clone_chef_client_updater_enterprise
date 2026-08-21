@@ -35,28 +35,10 @@ default_action :cleanup
 
 action_class do
   include ChefClientUpdaterEnterprise::Helpers
-
-  # Returns installed Habitat idents as 'origin/name/version/release' strings,
-  # sorted oldest-first. Uses filesystem glob — no hab CLI dependency.
-  def installed_idents
-    root = hab_pkg_root(new_resource.habitat_package)
-    dirs = hab_pkg_dirs(new_resource.habitat_package)
-    return [] if dirs.empty?
-
-    dirs.map do |dir|
-      # dir = /hab/pkgs/chef/chef-infra-client/VERSION/RELEASE
-      # Strip root prefix to get version/release
-      rel = dir.delete_prefix("#{root}/")
-      parts = rel.split('/')
-      next unless parts.length >= 2
-
-      "#{new_resource.habitat_package}/#{parts.first}/#{parts[1]}"
-    end.compact
-  end
 end
 
 action :cleanup do
-  idents = installed_idents
+  idents = hab_pkg_dirs(new_resource.habitat_package).filter_map { |dir| hab_ident_for_dir(new_resource.habitat_package, dir) }
 
   if idents.length <= new_resource.keep_versions
     Chef::Log.debug(

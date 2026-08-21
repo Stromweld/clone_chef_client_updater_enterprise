@@ -82,6 +82,28 @@ action :remove do
         'package found to remove.'
       )
     end
+  elsif platform_family?('debian')
+    # A plain `package`/`apt_package action :remove` (i.e. `apt-get remove`)
+    # refuses outright here with exit 100 ("Unmet dependencies") — chef-ice
+    # was unpacked with `--force-conflicts` (see install.rb) to override its
+    # declared `Conflicts: chef-workstation-enterprise`, but that override
+    # only lifted the block on INSTALLING chef-ice; it did nothing to the
+    # dependency graph apt still sees for the legacy omnibus `chef` package,
+    # which apt refuses to touch while that unresolved conflict exists on
+    # the box. `dpkg_package`'s `options` property passes straight through
+    # to the dpkg invocation, so `--force-depends` bypasses apt's dependency
+    # resolver entirely (the same category of override `install.rb` already
+    # applies on the install side via rpm_package/dpkg --force-conflicts),
+    # matching the pattern documented in AGENTS.md for this same conflict.
+    # dpkg_package still uses Chef's own `dpkg-query`-backed idempotency
+    # check (unlike the Habitat-package case in cleanup.rb, dpkg's notion of
+    # "installed" is exactly what's wanted here), so this stays a first-class
+    # Chef resource rather than a hand-rolled `execute`.
+    dpkg_package new_resource.legacy_omnibus_package do
+      action :remove
+      options '--force-depends'
+      ignore_failure true
+    end
   elsif linux?
     package new_resource.legacy_omnibus_package do
       action :remove

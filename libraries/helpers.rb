@@ -149,7 +149,7 @@ module ChefClientUpdaterEnterprise
       dirs = hab_pkg_dirs(pkg)
       target_dir =
         if version && version != 'latest'
-          dirs.select { |d| d.split('/')[-2] == version }.last
+          dirs.select { |d| hab_dir_version(d) == version }.last
         else
           dirs.last
         end
@@ -194,6 +194,27 @@ module ChefClientUpdaterEnterprise
       return [] unless ::File.directory?(root)
 
       ::Dir.glob("#{root}/*/*").select { |d| ::File.directory?(d) }.sort_by { |d| ::File.basename(d) }
+    end
+
+    # Extracts the VERSION component (second-to-last path segment) from a
+    # hab_pkg_dirs-style directory path (.../ORIGIN/NAME/VERSION/RELEASE).
+    def hab_dir_version(dir)
+      dir.split('/')[-2]
+    end
+
+    # Builds the full 'origin/name/version/release' ident string for a directory
+    # returned by hab_pkg_dirs(pkg), or nil if it doesn't have the expected
+    # VERSION/RELEASE shape. Shared by chef_client_updater_enterprise_binlinks
+    # (resolving the just-installed package to binlink) and
+    # chef_client_updater_enterprise_cleanup (enumerating installed idents), so
+    # both build the ident the same way.
+    def hab_ident_for_dir(pkg, dir)
+      root = hab_pkg_root(pkg)
+      rel = dir.delete_prefix("#{root}/")
+      parts = rel.split('/')
+      return unless parts.length >= 2
+
+      "#{pkg}/#{parts.first}/#{parts[1]}"
     end
 
     # Returns the most recently installed Habitat ident for the given package,
@@ -421,8 +442,7 @@ module ChefClientUpdaterEnterprise
       unless dirs.empty?
         newest = dirs.last
         # Path structure: .../VERSION/RELEASE — version is the second-to-last component
-        parts = newest.split('/')
-        fs_ver = parts[-2]
+        fs_ver = hab_dir_version(newest)
         return fs_ver unless fs_ver.nil? || fs_ver.empty?
       end
 

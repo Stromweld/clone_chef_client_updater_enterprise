@@ -17,6 +17,7 @@ ALL_CUSTOM_RESOURCES = %w(
   chef_client_updater_enterprise_binlinks
   chef_client_updater_enterprise_cleanup
   chef_client_updater_enterprise_remove_omnibus
+  chef_client_updater_enterprise_scheduler_reconvergence
 ).freeze
 
 # ChefSpec::SoloRunner#converge_block only compiles recipes/resources for

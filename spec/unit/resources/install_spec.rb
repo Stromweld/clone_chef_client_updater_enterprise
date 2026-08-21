@@ -2,13 +2,21 @@
 
 require 'spec_helper'
 
-# Regression coverage for the chef_binary_path flip-flop bug (see AGENTS.md
-# "Scheduler Resource Reconvergence"): action :install's "already at pinned
-# version" branch used to `return` before reconverging scheduler resources,
-# so a no-op converge left chef_client_cron/systemd_timer/etc.'s own
-# chef_binary_path default (which varies by bootstrapping Chef gem vintage)
-# unoverridden. reconverge_installed_scheduler_resources must run on BOTH the
-# already-installed short-circuit and a genuine install/upgrade.
+# Regression coverage for the previously-fixed chef_binary_path flip-flop bug (see AGENTS.md
+# "Scheduler Reconvergence"). That fix was later intentionally REVERTED for a stricter gating
+# requirement: reconvergence must fire ONLY when a new install/upgrade actually happened THIS
+# converge AND update_scheduler_resources is true — not merely "update_scheduler_resources is
+# true", which is what the old already-installed early-return branch did by calling the
+# reconverge logic directly and unconditionally on every no-op converge. The wiring is now
+# entirely notification-driven (every install/upgrade resource `notifies :reconverge, ...,
+# :delayed`), so the early-return path declares nothing and notifies nothing — see
+# resources/install.rb's `action :install`. This DOES reopen the narrow scenario the old fix
+# addressed: if a scheduler resource (chef_client_cron/systemd_timer/etc.) is declared with a
+# non-lazy, hardcoded chef_binary_path default by an old bootstrap Chef gem, and chef-ice is
+# ALREADY installed at the pinned version on the very first converge that resource is compiled
+# in, nothing will ever correct that stale default, because no install happens on any subsequent
+# converge either (the version stays pinned). That tradeoff was accepted explicitly in favor of
+# precise gating; see AGENTS.md for the full writeup.
 #
 # Stubbing follows the same low-level pattern as spec/unit/resources/cleanup_spec.rb
 # (fake the filesystem primitives current_installed_version/chef_client_hab_binary_path
@@ -74,61 +82,24 @@ describe 'chef_client_updater_enterprise_install' do
       end
     end
 
-    it 'still sets chef_binary_path on chef_client_cron even though nothing was (re)installed' do
+    it 'does NOT reconverge chef_binary_path on chef_client_cron since nothing was (re)installed' do
       resource = scheduler_resource(chef_run, :chef_client_cron, 'chef-client')
-      expect(resource.chef_binary_path).to eq(resolved_binary_path)
+      expect(resource.chef_binary_path).to_not eq(resolved_binary_path)
     end
 
-    it 'still sets chef_binary_path on chef_client_systemd_timer even though nothing was (re)installed' do
+    it 'does NOT reconverge chef_binary_path on chef_client_systemd_timer since nothing was (re)installed' do
       resource = scheduler_resource(chef_run, :chef_client_systemd_timer, 'chef-client')
-      expect(resource.chef_binary_path).to eq(resolved_binary_path)
+      expect(resource.chef_binary_path).to_not eq(resolved_binary_path)
     end
 
     it 'does not attempt to (re)install the package' do
       expect(chef_run).to_not install_rpm_package('chef-ice')
       expect(chef_run).to_not install_package('chef-ice')
     end
-  end
 
-  context 'the same pinned-and-installed state reconverges a second time' do
-    # Regression-specific: the bug only manifested because the OLD action
-    # returned early. A single converge already exercises the "already
-    # installed" branch above; this second, independent converge proves the
-    # resolved path stays stable across repeated no-op runs rather than
-    # reverting to whatever the scheduler resource's own built-in default
-    # would otherwise compute.
-    let(:first_run) do
-      stub_installed_pinned_version
-      pinned = pinned_version
-
-      converge_resource do
-        chef_client_cron 'chef-client'
-
-        chef_client_updater_enterprise_install 'chef-ice' do
-          version pinned
-        end
-      end
-    end
-
-    let(:second_run) do
-      stub_installed_pinned_version
-      pinned = pinned_version
-
-      converge_resource do
-        chef_client_cron 'chef-client'
-
-        chef_client_updater_enterprise_install 'chef-ice' do
-          version pinned
-        end
-      end
-    end
-
-    it 'resolves the identical chef_binary_path on every subsequent no-op converge' do
-      first_path = scheduler_resource(first_run, :chef_client_cron, 'chef-client').chef_binary_path
-      second_path = scheduler_resource(second_run, :chef_client_cron, 'chef-client').chef_binary_path
-
-      expect(first_path).to eq(resolved_binary_path)
-      expect(second_path).to eq(resolved_binary_path)
+    it 'never declares the scheduler_reconvergence resource on the early-return path' do
+      resource = chef_run.find_resource(:chef_client_updater_enterprise_scheduler_reconvergence, 'default')
+      expect(resource).to be_nil
     end
   end
 
@@ -267,6 +238,36 @@ describe 'chef_client_updater_enterprise_install' do
     end
   end
 
+  # Regression coverage: chef-ice's .deb declares `Conflicts: chef-workstation`, so a
+  # plain `dpkg --unpack` refuses to unpack it on any box that already has any
+  # chef-workstation variant installed — including CI runners that bootstrap via
+  # chef-workstation-enterprise purely to get kitchen/inspec tooling (dpkg: "conflicting
+  # packages - not installing chef-ice"). --force-conflicts overrides that declaration;
+  # this cookbook considers it overly broad rather than an actual incompatibility, since
+  # chef-ice and chef-workstation are expected to coexist side-by-side under Habitat.
+  context 'installing chef-ice on Debian-family platforms' do
+    it 'unpacks with --force-conflicts to override the chef-workstation package conflict' do
+      stub_not_installed
+
+      run = converge_resource(platform: 'ubuntu', version: '24.04') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          version '19.3.15'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1_amd64.deb'
+          checksum 'fe004919ddbf171947c6a59d9bd5d516a61ff30e64cf6e4ddd95521b90cc80af'
+          manage_binlinks false
+          update_scheduler_resources false
+        end
+      end
+
+      unpack = run.resource_collection.all_resources.find do |r|
+        r.resource_name == :execute && r.name.start_with?('dpkg --unpack')
+      end
+
+      expect(unpack).to_not be_nil
+      expect(unpack.command).to include('--force-conflicts')
+    end
+  end
+
   # `version` is compared against the literal string 'latest' in resources/install.rb,
   # resources/binlinks.rb and Helpers#chef_client_hab_binary_path. Before the shared
   # property gained a coerce, install.rb's case-sensitive `== 'latest'` disagreed with
@@ -376,6 +377,25 @@ describe 'chef_client_updater_enterprise_install' do
         :preserve_omnibus, :fstab_handling
       )
     end
+
+    # migrate-ice is itself a Habitat binary and gates on the interactive Habitat
+    # license prompt when HAB_LICENSE is unset. execute's `environment` REPLACES
+    # the child process's env rather than merging with the parent's, so omitting
+    # HAB_LICENSE here (as opposed to binlinks.rb/cleanup.rb, which both pass
+    # `environment hab_env`) hangs any CI converge that actually needs to run it.
+    it 'passes HAB_LICENSE alongside CHEF_LICENSE_KEY to migrate-ice, since environment replaces rather than merges with the parent env' do
+      run = converge_with do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          download_url 'https://example.invalid/chef-ice.deb'
+          license_key 'abc123'
+          manage_binlinks false
+          update_scheduler_resources false
+        end
+      end
+      resource = run.find_resource(:execute, 'migrate-ice apply airgap')
+
+      expect(resource.environment).to include('HAB_LICENSE' => 'accept-no-persist', 'CHEF_LICENSE_KEY' => 'abc123')
+    end
   end
 
   # execute[migrate-ice apply airgap] is guarded by only_if on
@@ -405,11 +425,42 @@ describe 'chef_client_updater_enterprise_install' do
 
       pkg = run.find_resource(:package, 'chef-ice')
       notification = pkg.delayed_notifications.find do |n|
-        n.resource.to_s == 'ruby_block[reconverge installed scheduler resources]'
+        n.resource.to_s == 'chef_client_updater_enterprise_scheduler_reconvergence[default]'
       end
 
       expect(notification).to_not be_nil
-      expect(notification.action).to eq(:run)
+      expect(notification.action).to eq(:reconverge)
+    end
+
+    # migrate-ice apply airgap's own not_if can already be satisfied on a converge
+    # that just installed a new chef-ice via dpkg (e.g. the Habitat package was
+    # pre-populated by something else, like a chef-workstation bootstrap sharing
+    # /hab/pkgs). Since it was the only Debian-path resource wired to reconverge,
+    # that left a genuine dpkg-level install with no notification at all. The
+    # dpkg --configure ruby_block runs the actual install/upgrade and has its own
+    # independent not_if (dpkg_already_current), so it must carry the notification
+    # too.
+    it 'notifies reconvergence from the dpkg --configure ruby_block on Debian' do
+      stub_not_installed
+
+      run = converge_resource(platform: 'ubuntu', version: '24.04') do
+        chef_client_updater_enterprise_install 'chef-ice' do
+          version '19.3.15'
+          download_url 'https://example.invalid/chef-ice-19.3.15-1_amd64.deb'
+          checksum 'a' * 64
+        end
+      end
+
+      configure_block = run.resource_collection.all_resources.find do |r|
+        r.resource_name == :ruby_block && r.name.start_with?('dpkg --configure')
+      end
+
+      notification = configure_block.delayed_notifications.find do |n|
+        n.resource.to_s == 'chef_client_updater_enterprise_scheduler_reconvergence[default]'
+      end
+
+      expect(notification).to_not be_nil
+      expect(notification.action).to eq(:reconverge)
     end
   end
 

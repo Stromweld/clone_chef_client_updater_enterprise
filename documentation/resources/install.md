@@ -42,7 +42,7 @@ Introduced: v0.1.0
 | `download_retries` | Integer | `5` | Times to retry the package download. Must be `0` or greater. See [CDN propagation delay](#cdn-propagation-delay-and-download-verification). |
 | `download_retry_delay` | Integer | `30` | Seconds between package download attempts. Must be `0` or greater. See [CDN propagation delay](#cdn-propagation-delay-and-download-verification). |
 | `manage_binlinks` | true, false | `true` | Automatically run `chef_client_updater_enterprise_binlinks` after a successful install. |
-| `update_scheduler_resources` | true, false | `true` | When this converge actually installs a new chef-ice version, repoint any `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task` resources found in the resource collection at the just-installed client. Requires `manage_binlinks true` (or an externally managed, current binlink). See [Scheduler Resource Reconvergence](#scheduler-resource-reconvergence). |
+| `update_scheduler_resources` | true, false | `true` | When this converge actually installs a new chef-ice version, declare and run `chef_client_updater_enterprise_scheduler_reconvergence` to repoint any `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task` resources found in the resource collection at the just-installed client. Requires `manage_binlinks true` (or an externally managed, current binlink). See [Scheduler Resource Reconvergence](#scheduler-resource-reconvergence). |
 | `preserve_omnibus` | true, false | `true` | Pass `--preserve-omnibus` to `migrate-ice` so an existing legacy omnibus Chef installation is left in place instead of being deleted. |
 | `fstab_handling` | `apply`, `fail`, `ignore` | `ignore` when `preserve_omnibus` is `true`, otherwise `apply` | Value passed to `migrate-ice --fstab` on the migration code path, controlling what it does when `/opt/chef` is its own dedicated mount point: `apply` (migrate-ice's default) remounts that device at `/hab`, `fail` aborts, `ignore` leaves the mount alone. See [Mounted `/opt/chef` and `--fstab`](#mounted-optchef-and---fstab). |
 
@@ -184,44 +184,18 @@ filesystem.
 ## Scheduler Resource Reconvergence
 
 When `update_scheduler_resources` is `true` (the default) **and this converge actually installs a
-new chef-ice version**, this resource finds any
+new chef-ice version**, this resource declares and runs
+`chef_client_updater_enterprise_scheduler_reconvergence`, passing along its own `habitat_package`
+and `version`. That resource finds any
 `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task`
 resources already declared in the run's resource collection, explicitly sets their
 `chef_binary_path` property, and re-runs each one's own previously-declared action(s) in place — no
-process handoff (re-exec or exit) of any kind is involved, on any platform.
+process handoff (re-exec or exit) of any kind is involved, on any platform. See
+[`chef_client_updater_enterprise_scheduler_reconvergence`](scheduler_reconvergence.md) for the full
+mechanism and rationale.
 
 The sole purpose is to point an existing schedule at the newly-installed client so its next
 *scheduled* run uses it.
-
-On Linux and macOS, `chef_binary_path` is set to the **fully-versioned Habitat path** (for example
-`/hab/pkgs/chef/chef-infra-client/19.3.15/20260601120000/bin/chef-client`), not the
-`/usr/bin/chef-client` binlink. The scheduler resources re-resolve `chef_binary_path` at every
-scheduled invocation, running as root/SYSTEM, so a writable well-known symlink there would be a
-standing local privilege-escalation target between chef-client runs. If `version` is pinned, the
-pinned version is resolved rather than simply the newest one present on disk, so an intentional
-rollback is not silently undone.
-
-**Windows is the exception**: `chef_binary_path` is set to `C:\hab\bin\chef-client.bat` when that
-shim resolves to the version this converge installed. `hab pkg binlink` does not create a symlink on
-Windows — it generates a `.bat` shim whose *contents* name the resolved, fully-versioned package
-path, so the version is pinned inside the file and there is no mutable indirection to hijack. This
-is also exactly what Chef Infra Client's own `chef_binary_path` default resolves to on Windows;
-using any other value would leave the scheduled task permanently out of sync with that default, so
-every converge that re-evaluated it would report the task as updated.
-
-Because the shim's *contents* are what actually decide which client the next scheduled run executes,
-the shim is verified before it is used. A shim left behind by a previous install still names the old
-package directory, so following it blindly would schedule the very version this converge replaced.
-When the shim does not name the resolved version, the resource logs a warning and points the
-schedule at the fully-versioned Habitat path instead. With the default `manage_binlinks true` this
-never happens — the binlink is refreshed earlier in the same converge — so the fallback only shows up
-when the binlink is externally managed and has gone stale.
-
-The property is set explicitly rather than left to whatever default the resource would otherwise
-compute: the chef-client actually bootstrapping the converge may be an older release (e.g. the
-`stable` channel's 18.11.11) whose `chef_binary_path` default is a plain, non-lazy, hardcoded
-legacy path — not the hab-aware lazy default newer Chef Infra Client releases have — so there is no
-default behavior this cookbook can safely rely on to self-correct.
 
 ### What triggers it
 
@@ -249,7 +223,8 @@ That gating is deliberate in both directions:
   unconditionally would report a changed resource on every converge forever.
 
 The one other entry point is `action :install`'s early return for an explicitly pinned version that
-is already installed, which performs the same reconvergence directly in Ruby (it returns before the
+is already installed, which declares and runs
+`chef_client_updater_enterprise_scheduler_reconvergence` directly (it returns before the
 `ruby_block` is ever declared).
 
 The delayed notification is registered in this resource's own child `RunContext`, so it is drained
