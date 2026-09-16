@@ -602,8 +602,7 @@ action :install do
       fresh_flag = fresh_install ? ' --fresh-install' : ''
       fstab_flag = fresh_install ? '' : " --fstab #{new_resource.fstab_handling}"
       license_flag = new_resource.license_key ? " --license-key #{new_resource.license_key}" : ''
-      "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore " \
-        "#{license_flag}#{preserve_flag}#{fresh_flag}#{fstab_flag}"
+      "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore #{license_flag}#{preserve_flag}#{fresh_flag}#{fstab_flag}"
     }
     environment lazy { hab_env.merge('CHEF_LICENSE_KEY' => license.to_s) }
     sensitive true
