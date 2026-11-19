@@ -277,7 +277,53 @@ describe ChefClientUpdaterEnterprise::Helpers do
     end
   end
 
+  describe '#regular_ident?' do
+    it 'accepts only a regular file, not a symlink, directory or missing path' do
+      Dir.mktmpdir do |dir|
+        real = File.join(dir, 'IDENT')
+        File.write(real, 'chef/chef-infra-client/19.4.61/1')
+        link = File.join(dir, 'IDENT-link')
+        File.symlink(real, link)
+        dangling = File.join(dir, 'IDENT-dangling')
+        File.symlink(File.join(dir, 'nope'), dangling)
+        sub = File.join(dir, 'IDENT-dir')
+        Dir.mkdir(sub)
+        expect(host.regular_ident?(real)).to be true
+        expect(host.regular_ident?(link)).to be false
+        expect(host.regular_ident?(dangling)).to be false
+        expect(host.regular_ident?(sub)).to be false
+        expect(host.regular_ident?(File.join(dir, 'missing'))).to be false
+      end
+    end
+  end
+
   describe '#hab_pkg_dirs' do
+    it 'ignores release directories without an IDENT file (partial or failed unpack)' do
+      root = '/hab/pkgs/chef/chef-infra-client'
+      good = "#{root}/19.4.56/20261001000000"
+      partial = "#{root}/19.4.61/20261101000000"
+      allow(::File).to receive(:directory?).and_call_original
+      [root, good, partial].each { |d| allow(::File).to receive(:directory?).with(d).and_return(true) }
+      allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return([partial, good])
+      allow(::File).to receive(:file?).and_call_original
+      allow(::File).to receive(:file?).with("#{good}/IDENT").and_return(true)
+      allow(::File).to receive(:file?).with("#{partial}/IDENT").and_return(false)
+
+      expect(host.hab_pkg_dirs('chef/chef-infra-client')).to eq([good])
+    end
+
+    it 'ignores a release whose IDENT is a symlink' do
+      Dir.mktmpdir do |dir|
+        allow(host).to receive(:hab_pkg_root).and_return(dir)
+        good = File.join(dir, '19.4.56', '1')
+        linked = File.join(dir, '19.4.61', '2')
+        [good, linked].each { |d| FileUtils.mkdir_p(d) }
+        File.write(File.join(good, 'IDENT'), 'x')
+        File.symlink(File.join(good, 'IDENT'), File.join(linked, 'IDENT'))
+        expect(host.hab_pkg_dirs('chef/chef-infra-client')).to eq([good])
+      end
+    end
+
     it 'returns an empty array when the package root does not exist' do
       allow(::File).to receive(:directory?).with('/hab/pkgs/chef/chef-infra-client').and_return(false)
       expect(host.hab_pkg_dirs('chef/chef-infra-client')).to eq([])
@@ -291,10 +337,68 @@ describe ChefClientUpdaterEnterprise::Helpers do
       allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return(unsorted)
       allow(::File).to receive(:directory?).with(unsorted.first).and_return(true)
       allow(::File).to receive(:directory?).with(unsorted.last).and_return(true)
+      allow(::File).to receive(:file?).and_call_original
+      unsorted.each { |d| allow(::File).to receive(:file?).with("#{d}/IDENT").and_return(true) }
 
       expect(host.hab_pkg_dirs('chef/chef-infra-client')).to eq(
         ["#{root}/19.2.12/20260101090000", "#{root}/19.3.15/20260601120000"]
       )
+    end
+  end
+
+  describe '#native_version_installed?' do
+    it 'is true only when the native package records exactly that version' do
+      allow(host).to receive(:current_native_version).with('chef-ice').and_return('19.4.61')
+      expect(host.native_version_installed?('chef-ice', '19.4.61')).to be true
+      expect(host.native_version_installed?('chef-ice', '19.4.62')).to be false
+    end
+
+    it 'is false when the package is not installed or the version is unknown' do
+      allow(host).to receive(:current_native_version).with('chef-ice').and_return(nil)
+      expect(host.native_version_installed?('chef-ice', '19.4.61')).to be false
+      expect(host.native_version_installed?('chef-ice', nil)).to be false
+    end
+  end
+
+  describe '#current_native_version on macOS' do
+    before { host.fake_platform = 'mac_os_x' }
+
+    def pkgutil(receipt, ok:, stdout: '')
+      so = instance_double(Mixlib::ShellOut, run_command: nil, exitstatus: ok ? 0 : 1, stdout: stdout)
+      allow(Mixlib::ShellOut).to receive(:new).with('pkgutil', '--pkg-info', receipt, timeout: 15).and_return(so)
+    end
+
+    it 'reads the chef-ice DMG receipt io.chef.chef-ice.core' do
+      pkgutil('io.chef.chef-ice.core', ok: true, stdout: "package-id: io.chef.chef-ice.core\nversion: 19.4.61\n")
+      expect(host.current_native_version('chef-ice')).to eq('19.4.61')
+    end
+
+    it 'reads the omnibus receipt com.getchef.pkg.chef before the legacy com.chef.chef' do
+      pkgutil('com.getchef.pkg.chef', ok: true, stdout: "version: 18.11.11\n")
+      expect(Mixlib::ShellOut).to_not receive(:new).with('pkgutil', '--pkg-info', 'com.chef.chef', timeout: 15)
+      expect(host.current_native_version('chef')).to eq('18.11.11')
+    end
+
+    it 'returns nil when both omnibus receipts are absent' do
+      pkgutil('com.getchef.pkg.chef', ok: false)
+      pkgutil('com.chef.chef', ok: false)
+      expect(host.current_native_version('chef')).to be_nil
+    end
+
+    it 'returns nil for a registered receipt without a version line' do
+      pkgutil('io.chef.chef-ice.core', ok: true, stdout: "package-id: io.chef.chef-ice.core\n")
+      expect(host.current_native_version('chef-ice')).to be_nil
+    end
+
+    it 'falls back to the legacy omnibus receipt' do
+      pkgutil('com.getchef.pkg.chef', ok: false)
+      pkgutil('com.chef.chef', ok: true, stdout: "version: 17.10.0\n")
+      expect(host.current_native_version('chef')).to eq('17.10.0')
+    end
+
+    it 'returns nil when no receipt is registered' do
+      pkgutil('io.chef.chef-ice.core', ok: false)
+      expect(host.current_native_version('chef-ice')).to be_nil
     end
   end
 
@@ -576,6 +680,99 @@ describe ChefClientUpdaterEnterprise::Helpers do
     it 'passes the text through when no key is set' do
       expect(host.scrub_license_key('no key here', nil)).to eq('no key here')
       expect(host.scrub_license_key('no key here', '')).to eq('no key here')
+    end
+  end
+
+  describe '#unsupported_chef_ice_version!' do
+    %w(19.3.15 19.4.50).each do |v|
+      it "rejects #{v} as unsupported" do
+        expect { host.unsupported_chef_ice_version!(v) }
+          .to raise_error(Chef::Exceptions::ValidationFailed, /chef-ice #{Regexp.escape(v)} is not supported/)
+      end
+    end
+
+    %w(19.4.51 19.4.61 20.0.0).each do |v|
+      it "accepts #{v}" do
+        expect { host.unsupported_chef_ice_version!(v) }.not_to raise_error
+      end
+    end
+
+    # ValidationFailed is an ArgumentError; the rescue must wrap only the parse,
+    # or the "not supported" error above turns into this one.
+    it 'reports an unparseable version as invalid, not unsupported' do
+      expect { host.unsupported_chef_ice_version!('not a version') }
+        .to raise_error(Chef::Exceptions::ValidationFailed, /is not a valid chef-ice version/)
+    end
+  end
+
+  describe '#windows_msi_package_name' do
+    def stub_ps(stdout:, exitstatus: 0)
+      cmd = instance_double(Mixlib::ShellOut, run_command: nil, stdout: stdout, exitstatus: exitstatus)
+      allow(Mixlib::ShellOut).to receive(:new).and_return(cmd)
+    end
+
+    it 'returns nil without shelling out off Windows or without a version' do
+      expect(Mixlib::ShellOut).not_to receive(:new)
+      expect(host.windows_msi_package_name('chef-ice', '19.4.61')).to be_nil
+      host.fake_windows = true
+      expect(host.windows_msi_package_name('chef-ice', nil)).to be_nil
+    end
+
+    context 'on Windows' do
+      before { host.fake_windows = true }
+
+      it 'returns the recorded package name' do
+        stub_ps(stdout: "chef-ice-19.4.61-1_x64.msi\r\n")
+        expect(host.windows_msi_package_name('chef-ice', '19.4.61')).to eq('chef-ice-19.4.61-1_x64.msi')
+      end
+
+      it 'returns nil when there is not exactly one matching product' do
+        stub_ps(stdout: '', exitstatus: 1)
+        expect(host.windows_msi_package_name('chef-ice', '19.4.61')).to be_nil
+      end
+
+      it 'rejects names that are not a bare .msi file name' do
+        ['', 'chef-ice.exe', 'C:\\x\\chef-ice.msi', '../chef-ice.msi'].each do |out|
+          stub_ps(stdout: out)
+          expect(host.windows_msi_package_name('chef-ice', '19.4.61')).to be_nil
+        end
+      end
+
+      it 'matches the exact version and escapes quotes in the query' do
+        stub_ps(stdout: 'x.msi')
+        host.windows_msi_package_name("chef'ice", '19.4.61')
+        expect(Mixlib::ShellOut).to have_received(:new) do |argv, **|
+          expect(argv.last).to include("DisplayVersion -eq '19.4.61'", "Escape('chef''ice')")
+        end
+      end
+    end
+  end
+
+  describe '#mount_point?' do
+    let(:path) { '/opt/chef' }
+
+    def stub_dev(path, dev)
+      allow(::File).to receive(:stat).with(path).and_return(double(dev: dev))
+    end
+
+    it 'is false when the path is not a directory' do
+      allow(::File).to receive(:directory?).with(path).and_return(false)
+      expect(::File).not_to receive(:stat)
+      expect(host.mount_point?(path)).to be false
+    end
+
+    it 'is false when the path is on its parent filesystem' do
+      allow(::File).to receive(:directory?).with(path).and_return(true)
+      stub_dev(path, 1)
+      stub_dev('/opt', 1)
+      expect(host.mount_point?(path)).to be false
+    end
+
+    it 'is true when a separate filesystem is mounted at the path' do
+      allow(::File).to receive(:directory?).with(path).and_return(true)
+      stub_dev(path, 2)
+      stub_dev('/opt', 1)
+      expect(host.mount_point?(path)).to be true
     end
   end
 end

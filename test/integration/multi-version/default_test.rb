@@ -3,7 +3,7 @@
 # InSpec Integration Test:: multi-version
 #
 # Verifies the pinned-upgrade scenario driven by the `multi_version` recipe: an
-# older chef-ice is installed first, then 19.3.15, then an UNPINNED `latest`;
+# pinned chef-ice is installed first, then an UNPINNED `latest`;
 # binlinks are pointed at the newest version and cleanup keeps only that one.
 #
 # The third install is deliberately unpinned, so the version that must survive
@@ -47,7 +47,7 @@ end
 pinned = input('expected_chef_ice_version', value: nil)
 expected_version = pinned.is_a?(String) && !pinned.empty? ? pinned : nil
 expected_version ||= published_latest_version(
-  input('chef_ice_channel', value: 'stable'),
+  input('chef_ice_channel', value: 'current'),
   'chef-ice',
   ENV.fetch('CHEF_LICENSE_KEY', nil)
 )
@@ -58,7 +58,8 @@ describe command('chef-client --version') do
 end
 
 if os.linux?
-  older_chef_ice_version = input('older_chef_ice_version', value: '19.2.12')
+  # Set once the recipe installs two distinct releases (see its TODO).
+  older_chef_ice_version = input('older_chef_ice_version', value: nil)
 
   # Discover what actually survived rather than trusting a hardcoded value, and
   # additionally assert exactly ONE version directory remains (not just that a
@@ -104,8 +105,10 @@ if os.linux?
     end
   end
 
-  describe file("/hab/pkgs/chef/chef-infra-client/#{older_chef_ice_version}") do
-    it { should_not exist }
+  if older_chef_ice_version
+    describe file("/hab/pkgs/chef/chef-infra-client/#{older_chef_ice_version}") do
+      it { should_not exist }
+    end
   end
 end
 

@@ -2,6 +2,20 @@
 
 This file is used to list changes made in each version of the chef_client_updater_enterprise cookbook.
 
+## Unreleased
+
+- install: hand chef-ice (releases newer than 19.4.50) to the native installer (`rpm_package`,
+  `dpkg_package`, `dmg_package`, `windows_package`), which runs migrate-ice itself
+- install: pass installer settings via `/tmp/chef_env` (Linux/macOS) or MSI properties (Windows);
+  `manage_binlinks false` sends `CHEF_SKIP_BINLINKING`, and `CHEF_SKIP_OLD_RELEASE_REMOVAL` is always
+  sent so `cleanup` owns old-release removal
+- install: a release counts only with a regular (non-symlink) `IDENT`; the early return requires a
+  complete release, and the converge fails if the target release is missing after install
+- install: repair a registered-but-incomplete release automatically on RPM (`rpm -U --replacepkgs`),
+  DEB (`dpkg -i`), macOS and Windows (`msiexec /i … REINSTALL=ALL REINSTALLMODE=vamus` from the
+  downloaded MSI, copied first to the file name Windows Installer recorded at install time)
+- remove_omnibus: empty `/opt/chef` instead of deleting it when it is a mount point
+
 ## 0.3.0 (2026-08-17)
 
 - added scheduler_reconvergence resource

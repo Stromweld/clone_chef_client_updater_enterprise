@@ -3,7 +3,7 @@
 
 [back to resource list](../../README.md#resources)
 
-Installs Chef Infra Client via `chef-ice` native OS packages (rpm/deb/msi), resolving the
+Installs Chef Infra Client via `chef-ice` native OS packages (rpm/deb/dmg/msi), resolving the
 platform-appropriate package artifact through [Chef's Commercial Download
 API](https://docs.chef.io/download/commercial/). No gem is installed at runtime and there are no
 metadata dependencies — the lookup uses Chef's in-box `Chef::HTTP::Simple`, so it honors the same
@@ -13,7 +13,12 @@ Side-by-side, multi-version installs are supported on every platform (RPM, deb, 
 preserving any existing legacy omnibus Chef installation, and installing a newer `chef-ice` version
 never removes an older one that is still on disk (each version's Habitat-managed payload lives
 under its own versioned path). See "Preserving Multiple Installed Versions" below for how each
-package manager's destructive default behavior is bypassed.
+each platform is installed.
+
+Only chef-ice releases **newer than 19.4.50** are supported; older releases raise
+`Chef::Exceptions::ValidationFailed` before anything is installed. With `download_url` and
+`version 'latest'` the version is unknown and the check is skipped. On macOS, `download_url`
+requires an explicit `version`.
 
 A valid `license_key` is required whenever `download_url` is not set. The resource raises
 `Chef::Exceptions::ConfigurationError` at converge time if the key is missing or blank.
@@ -103,83 +108,84 @@ cached artifact, and each retry re-downloads in full.
 
 ## Preserving Multiple Installed Versions
 
-Every `chef-ice` package (rpm, deb, and MSI) bundles a `migrate-ice` tool that unconditionally runs
-as part of the native package manager's own install transaction, with no supported flag to skip
-`--preserve-omnibus` or avoid deleting a previously installed version's files. This resource works
-around each package manager's specific behavior so that:
+Each platform's native installer runs `migrate-ice` itself and honors the settings this resource
+passes, so a newer `chef-ice` never removes an older version's Habitat directory, and the legacy
+omnibus install is kept when `preserve_omnibus` is `true`.
 
-- The currently-running `chef-client` process (which may itself be executing out of an older
-  version's installed path) is never interrupted mid-converge.
-- The legacy omnibus Chef installation is preserved when `preserve_omnibus` is `true`.
-- Multiple `chef-ice` versions can coexist on disk (Habitat manages the versioned payload;
-  only the native package manager's single "installed version" pointer changes).
+- **RHEL/SUSE family:** `rpm_package` from the downloaded file. chef-ice's `%preun` only acts on a
+  full erase, so an upgrade leaves the previous version under `/hab/pkgs`.
+- **Debian family:** `dpkg_package` from the downloaded file.
+- **macOS:** `dmg_package` with `type 'pkg'`, mounting the volume `Chef Infra Client <version>`.
+- **Windows:** `windows_package` (`installer_type :msi`, `timeout 1800`, since installs take 7-13
+  minutes). All chef-ice MSIs share one `UpgradeCode`, so the new MSI replaces the old one in Programs
+  and Features; the old Habitat release stays under `C:\hab\pkgs` until `cleanup` removes it. `TARGETDIR=C:\` is
+  always passed so the payload lands under `C:\hab`.
 
-Platform-specific handling:
+Each package resource is skipped when the target version is already present under `/hab/pkgs`.
 
-- **RHEL family (RHEL, Amazon Linux, Fedora, SLES/SUSE):** Installs via Chef's `rpm_package`
-  resource directly (bypassing `dnf`/`yum`) with `--replacefiles --noscripts --nodigest`.
-  `--noscripts` suppresses the RPM's own `%post` scriptlet (which always runs `migrate-ice` without
-  `--preserve-omnibus`); the resource then runs `migrate-ice` itself via an `execute` resource,
-  passing `--preserve-omnibus` when requested. `--nodigest` is required because `chef-ice`'s RPMs
-  lack a modern per-file payload digest, which rpm 4.x tolerates but rpm 6.x (Fedora 44) rejects
-  outright; it disables only that specific check, not the SHA256 verification this resource
-  performs on the download itself. Plain `rpm -i` never removes a different, already-installed
-  NEVRA of the same package, so older versions' Habitat directories are left untouched.
-- **Debian family (Ubuntu, Debian):** Drives `dpkg`'s two-phase lifecycle directly
-  (`dpkg --unpack` then `dpkg --configure`), temporarily stubbing out `migrate-ice` (and, on
-  upgrades, the previous package's `postrm`) between those two phases so the real `migrate-ice`
-  binary can be invoked separately with `--preserve-omnibus`, avoiding both the destructive
-  `postinst` migration and the previous version's `postrm` deleting the entire `/hab` tree during
-  an upgrade transaction. The stub, `dpkg --configure` and restore steps run inside a single
-  `ruby_block` with a `begin/ensure`, so a failed `dpkg --configure` cannot leave `migrate-ice`
-  stubbed out on disk; a matching self-heal step reclaims a backup stranded by a harder failure
-  (reboot, SIGKILL) before the next `dpkg --unpack`.
-- **Windows:** Installs via Chef's `windows_package` resource (`installer_type :msi`). Since each
-  `chef-ice` release uses a distinct MSI `ProductCode`/`UpgradeCode`, side-by-side installs of
-  different versions are already safe natively — no `dnf`/`yum`-style obsoletes handling to work
-  around. Sets the `CHEF_PRESERVE_OMNIBUS=1` MSI property (via `options`) when `preserve_omnibus`
-  is `true`, which the package's embedded `PostInstall.ps1` custom action forwards to
-  `migrate-ice --preserve-omnibus`. Note: this MSI property only exists on `chef-ice` releases
-  built on/after ~2026-04-23; older releases always migrate destructively regardless of this
-  setting. The MSI install can legitimately take 7-13 minutes (the `timeout` property defaults to
-  `1800` seconds to accommodate this). Also always passes `TARGETDIR=C:\` so the payload lands on
-  the Windows volume — `chef-ice` MSIs older than 19.3.15 do not set `TARGETDIR` themselves, and
-  Windows Installer would otherwise fall back to `ROOTDRIVE` (the fixed drive with the most free
-  space), installing to e.g. `D:\hab` where neither the package's own `PostInstall.ps1` nor this
-  cookbook's `C:\hab`-based path helpers can find anything.
-- **All other platforms (e.g. macOS):** Installs via Chef's built-in `package` resource with no
-  special-casing.
+## Incomplete releases and recovery
 
-## Mounted `/opt/chef` and `--fstab`
+A Habitat release counts as installed only when its directory holds a regular (non-symlink)
+`IDENT` file. When the target version is known, a guard after the package step fails the converge
+if no such release of that version exists. If the package manager already records the target
+version but the release is incomplete (an interrupted migration), the next converge repairs it:
 
-`migrate-ice` has two distinct code paths, chosen automatically by this resource (see
-`chef_client_on_path?` in `libraries/helpers.rb`):
+- **RPM:** `rpm -U --replacepkgs` of the same file re-runs `%post`.
+- **DEB:** `dpkg -i` of the same `.deb` re-runs `postinst`.
+- **macOS:** `dmg_package` reinstalls the `.pkg`.
+- **Windows:** `windows_package` skips the registered MSI, so a guarded `execute` runs
+  `msiexec /i "<msi>" REINSTALL=ALL REINSTALLMODE=vamus` with the same properties as the install
+  (`TARGETDIR=C:\`, `CHEF_SKIP_OLD_RELEASE_REMOVAL=1`, and `CHEF_PRESERVE_OMNIBUS=1` /
+  `CHEF_SKIP_BINLINKING=1` when they apply), logging to `<download_dir>\<product>-<version>-repair.log`.
+  Exit codes 0 and 3010 (success, reboot required) are accepted.
 
-- **fresh-install path** (`--fresh-install`, used when no `chef-client` resolves via `$PATH`) —
-  extracts the airgap bundle unconditionally and never touches mounts.
-- **migration path** (no `--fresh-install`, used when `chef-client` IS on `$PATH`) — additionally
-  processes the `--fstab` flag.
+Windows Installer accepts this maintenance install only from a package with the file name it
+recorded when the product was installed (its `PackageName`). Any other name failed with 1603
+(`SECREPAIR: Error determining package source type`), and repairing by ProductCode alone failed
+with 1706 once the original MSI was gone. The resource therefore asks Windows Installer for that
+name and, when it differs from the downloaded file, copies the downloaded MSI to that name in the
+same directory before running `msiexec`. This was tested with chef-ice installed from a differently
+named MSI that was then deleted, with `manage_binlinks` true and false.
 
-On the migration path, `migrate-ice`'s own `--fstab` default is `apply`, which means "take the
-block device currently mounted at `/opt/chef` and remount it at `/hab`". When `/opt/chef` is its
-own mount point this does **not** degrade gracefully — it hard-fails the whole migration and rolls
-back:
+To repair by hand, from an elevated prompt, use an MSI of the same version named exactly as the
+recorded `PackageName`:
 
-```text
-[INFO] /opt/chef is mounted on device <dev>. Proceeding with migration.
-Failure while processing flag `fstab`, Error: error during mount migration:
-  failed to mount <dev> to /hab: exit status 32.
-chef-client migration failed. ... Initiating rollback...
+```powershell
+msiexec /i "C:\path\to\<recorded PackageName>.msi" REINSTALL=ALL REINSTALLMODE=vamus TARGETDIR=C:\ CHEF_PRESERVE_OMNIBUS=1 CHEF_SKIP_OLD_RELEASE_REMOVAL=1 CHEF_SKIP_BINLINKING=1 /qn /norestart /l*v C:\chef-ice-repair.log
 ```
 
-Because that is contradictory with `preserve_omnibus true` (keeping the omnibus install while
-moving the filesystem out from under it), `fstab_handling` defaults to `ignore` whenever
-`preserve_omnibus` is `true`, and only falls back to migrate-ice's own `apply` default when
-`preserve_omnibus` is `false`. Set `fstab_handling` explicitly to override.
+Omit `CHEF_SKIP_BINLINKING=1` if the repaired version should also become the active binlink. Do **not**
+use `msiexec /fa`: in testing, the properties never reached the installer, so migrate-ice removed
+the older releases under `C:\hab\pkgs`. Do not create an empty `IDENT` file; that
+hides an incomplete release.
 
-This is not a rare edge case: every `kitchen-dokken` container has `/opt/chef` bind-mounted in from
-the `chef/chef` data container, and some sites deliberately keep `/opt/chef` on a dedicated
-filesystem.
+Known risk: chef-ice MSIs built before the old-release-removal fix delete older releases on upgrade
+even when `CHEF_SKIP_OLD_RELEASE_REMOVAL=1` is passed.
+
+## Installer settings
+
+- **Linux/macOS:** written to `/tmp/chef_env` (root-owned, mode 0600, contents never logged) just
+  before the package installs: `CHEF_PRESERVE_OMNIBUS`, `CHEF_SKIP_BINLINKING`,
+  `CHEF_SKIP_OLD_RELEASE_REMOVAL`, `CHEF_FSTAB` (not on macOS) and `CHEF_LICENSE_KEY`. The installer reads and deletes it; this resource also deletes it at
+  the end of its action. If the converge fails after the file is written but before the installer
+  runs, it is left behind until the next install.
+- **Windows:** MSI properties `TARGETDIR=C:\`, `CHEF_PRESERVE_OMNIBUS=1`, `CHEF_SKIP_BINLINKING=1` and
+  `CHEF_SKIP_OLD_RELEASE_REMOVAL=1`; the license key
+  is set as a Machine environment variable only for the install, then removed.
+
+`CHEF_SKIP_OLD_RELEASE_REMOVAL` is always sent, so the installer keeps older releases and removal
+is left to `chef_client_updater_enterprise_cleanup`.
+
+`manage_binlinks false` tells the installer to skip binlinking and does not declare
+`chef_client_updater_enterprise_binlinks`.
+
+`preserve_omnibus false` is ignored, with a warning, while chef-client itself runs from the omnibus
+install; use `chef_client_updater_enterprise_remove_omnibus` on a later run.
+
+`fstab_handling` (`CHEF_FSTAB`) defaults to `ignore` when `preserve_omnibus` is `true`. migrate-ice's
+own default, `apply`, remounts a device mounted at `/opt/chef` onto `/hab`, which hard-fails where
+`/opt/chef` is its own mount point (every `kitchen-dokken` container) and contradicts preserving the
+omnibus install.
 
 ## Scheduler Resource Reconvergence
 
@@ -199,33 +205,20 @@ The sole purpose is to point an existing schedule at the newly-installed client 
 
 ### What triggers it
 
-Reconvergence runs from a `ruby_block` declared `action :nothing`, driven by **delayed notifications
-from whichever resource actually installed or upgraded chef-ice in this converge**:
-
-- On Linux, `execute[migrate-ice apply airgap]` — the step that populates `/hab/pkgs`. It carries a
-  `not_if` which is satisfied once the target version is already present, so on a steady-state
-  converge it does not run, does not notify, and no schedule is rewritten.
-- On Windows, the `windows_package` resource. `execute[migrate-ice apply airgap]` is guarded on a
-  Linux-only path and never runs there — the MSI's own embedded `PostInstall.ps1` custom action
-  invokes migrate-ice inside the msiexec transaction instead. `windows_package`'s registry-based
-  idempotency means it only notifies on a real install.
-- On any other platform, the generic `package` fallback, for the same reason.
-
-Chef de-duplicates delayed notifications by resource and action, so a platform where more than one
-of these fires still reconverges exactly once.
+Reconvergence is driven by **delayed notifications from the native package resource** (`rpm_package`,
+`dpkg_package`, `dmg_package` or `windows_package`). It is skipped when the target version is
+already present, so on a steady-state converge nothing installs, notifies, or rewrites a schedule.
 
 That gating is deliberate in both directions:
 
 - It scopes the feature to what it is for. This is not a general-purpose repair mechanism for a
   `chef_binary_path` that drifted for some unrelated reason; nothing re-asserts the path on
   converges where nothing was installed.
-- It preserves idempotency. `ruby_block` reports "updated" whenever its block runs, so running it
-  unconditionally would report a changed resource on every converge forever.
+- It preserves idempotency. Reconvergence re-runs the scheduler resources' actions, so running it
+  unconditionally could report changed resources on every converge.
 
-The one other entry point is `action :install`'s early return for an explicitly pinned version that
-is already installed, which declares and runs
-`chef_client_updater_enterprise_scheduler_reconvergence` directly (it returns before the
-`ruby_block` is ever declared).
+`action :install` returns early, before any of this is declared, when an explicitly pinned version
+is already installed; nothing is reconverged on that path.
 
 The delayed notification is registered in this resource's own child `RunContext`, so it is drained
 at the end of *this resource's* action rather than at the end of the whole chef-client run. That
@@ -279,7 +272,7 @@ Install multiple versions side-by-side without triggering binlink/reconvergence 
 
 ```ruby
 chef_client_updater_enterprise_install 'install older version' do
-  version '19.2.12'
+  version '19.4.56'
   manage_binlinks false
   update_scheduler_resources false
 end

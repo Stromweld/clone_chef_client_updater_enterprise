@@ -20,6 +20,8 @@ describe 'chef_client_updater_enterprise_scheduler_reconvergence' do
     allow(::File).to receive(:directory?).with(root).and_return(true)
     allow(::File).to receive(:directory?).with(release_dir).and_return(true)
     allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return([release_dir])
+    allow(::File).to receive(:file?).and_call_original
+    allow(::File).to receive(:file?).with("#{release_dir}/IDENT").and_return(true)
     allow(::File).to receive(:exist?).and_call_original
     allow(::File).to receive(:exist?).with(resolved_binary_path).and_return(true)
   end
@@ -146,6 +148,8 @@ describe 'chef_client_updater_enterprise_scheduler_reconvergence' do
       allow(::File).to receive(:directory?).with(windows_root).and_return(true)
       allow(::File).to receive(:directory?).with(windows_release_dir).and_return(true)
       allow(::Dir).to receive(:glob).with("#{windows_root}/*/*").and_return([windows_release_dir])
+      allow(::File).to receive(:file?).and_call_original
+      allow(::File).to receive(:file?).with("#{windows_release_dir}/IDENT").and_return(true)
       allow(::File).to receive(:exist?).and_call_original
       allow(::File).to receive(:exist?).with(shim_path).and_return(true)
       allow(::File).to receive(:exist?).with(::File.join(windows_release_dir, 'bin', 'chef-client.bat')).and_return(true)

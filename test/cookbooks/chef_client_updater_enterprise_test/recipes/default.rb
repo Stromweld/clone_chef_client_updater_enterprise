@@ -18,6 +18,7 @@ chef_client_updater_enterprise_install 'install chef-ice' do
   # license_key is read automatically from CHEF_LICENSE_KEY env var.
   # Explicitly pass it here if needed:
   license_key node['chef_client_updater_enterprise']['license_key']
+  channel node['chef_client_updater_enterprise']['channel']
 end
 
 # Step 2: Explicit binlinks step — ensures the chef-client binlink exists

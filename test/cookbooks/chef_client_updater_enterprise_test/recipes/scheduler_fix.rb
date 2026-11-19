@@ -36,4 +36,5 @@ end
 
 chef_client_updater_enterprise_install 'install chef-ice' do
   license_key node['chef_client_updater_enterprise']['license_key']
+  channel node['chef_client_updater_enterprise']['channel']
 end

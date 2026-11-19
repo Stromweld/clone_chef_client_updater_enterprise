@@ -9,8 +9,8 @@ and `.bat` shims in `C:\hab\bin\` on Windows. (The `--dest` is always passed exp
 Habitat's own default destination does not match these paths.) On Windows the resource also ensures
 `C:\hab\bin` is added to the system PATH.
 
-The underlying `execute` resource is idempotent on every platform. `migrate-ice apply airgap`
-already creates the binlink as a side effect of every install, so this resource's idempotency check
+The underlying `execute` resource is idempotent on every platform. The installer's migrate-ice
+already creates the binlink as a side effect of every install (unless `manage_binlinks false`), so this resource's idempotency check
 is normally satisfied immediately and `hab pkg binlink` never actually re-runs in practice. On
 Linux/macOS, idempotency is detected via `File.symlink?`/`File.readlink` against the resolved
 package path. On Windows, binlinks are generated `.bat` shim files rather than true symlinks, so
