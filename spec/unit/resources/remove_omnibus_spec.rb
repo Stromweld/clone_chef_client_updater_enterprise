@@ -61,4 +61,36 @@ describe 'chef_client_updater_enterprise_remove_omnibus' do
       expect(chef_run).to remove_package('chef')
     end
   end
+
+  context 'on macOS' do
+    let(:chef_run) do
+      stub_not_running_under_omnibus
+      stub_hab_pkg_present
+      allow(Dir).to receive(:exist?).and_call_original
+      allow(Dir).to receive(:exist?).with('/opt/chef').and_return(false)
+      # Modern receipt registered, legacy absent: only the registered one may be forgotten.
+      { 'com.getchef.pkg.chef' => 0, 'com.chef.chef' => 1 }.each do |r, rc|
+        stubs_for_resource("execute[pkgutil --forget #{r}]") do |res|
+          allow(res).to receive_shell_out('pkgutil', '--pkg-info', r, exitstatus: rc)
+        end
+      end
+
+      converge_resource(platform: 'mac_os_x', version: '12') do
+        chef_client_updater_enterprise_remove_omnibus 'purge legacy omnibus'
+      end
+    end
+
+    it 'forgets the registered com.getchef.pkg.chef receipt via argv' do
+      expect(chef_run).to run_execute('pkgutil --forget com.getchef.pkg.chef')
+        .with(command: ['pkgutil', '--forget', 'com.getchef.pkg.chef'])
+    end
+
+    it 'skips the unregistered legacy com.chef.chef receipt' do
+      expect(chef_run).to_not run_execute('pkgutil --forget com.chef.chef')
+    end
+
+    it "never forgets chef-ice's own receipt" do
+      expect(chef_run.find_resource(:execute, 'pkgutil --forget io.chef.chef-ice.core')).to be_nil
+    end
+  end
 end

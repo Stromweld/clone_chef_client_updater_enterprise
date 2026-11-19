@@ -92,7 +92,7 @@ suites:
       inspec_tests:
         - test/integration/multi-version
       inputs:
-        older_chef_ice_version: '19.2.12'
+        chef_ice_channel: current
   - name: scheduler-fix
     provisioner:
       named_run_list: scheduler_fix

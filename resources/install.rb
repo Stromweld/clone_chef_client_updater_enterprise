@@ -153,8 +153,18 @@ action :install do
   # return early if the requested version is already installed
   unless new_resource.version == 'latest'
     installed = current_installed_version(new_resource.product_name, new_resource.habitat_package)
-    if installed == new_resource.version
+    # The version lookup can report a release whose directory has no IDENT (an
+    # incomplete migration). Skip only when a complete release of that version
+    # exists, so an incomplete one reaches the install path and its verification.
+    complete = hab_pkg_dirs(new_resource.habitat_package).any? { |d| hab_dir_version(d) == new_resource.version }
+    if installed == new_resource.version && complete
       Chef::Log.debug("chef_client_updater_enterprise_install: #{new_resource.product_name} #{new_resource.version} already installed, skipping.")
+      # A failed earlier run may have left the installer settings file behind.
+      file "remove stale #{ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE}" do
+        path ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE
+        action :delete
+        sensitive true
+      end unless windows?
       return
     end
   end
@@ -238,381 +248,241 @@ action :install do
     action :create
   end
 
-  # NOTE: `version` must be set explicitly here. Without it, dnf/yum/apt providers
-  # treat ANY currently-installed version of `product_name` as satisfying an
-  # unconstrained install request and silently no-op, even when `source` points at
-  # a newer package artifact on disk (e.g. chef-ice 19.3.14 installed, 19.3.15
-  # downloaded — the package resource would report "already installed").
+  # chef-ice releases up to and including 19.4.50 predate the installer fixes this
+  # resource relies on (settings passed to migrate-ice via /tmp/chef_env or MSI
+  # properties, skip-binlinking, side-by-side upgrades). Fail before touching the
+  # system rather than half-installing a release whose installer ignores them.
+  unsupported_chef_ice_version!(pkg_version) if pkg_version
+
+  # The fixed installers always run migrate-ice themselves. If THIS chef-client is
+  # the omnibus install, migrate-ice must not be asked to delete /opt/chef: its
+  # running-client guard would wait on this very process and fail. Removal of the
+  # omnibus install is chef_client_updater_enterprise_remove_omnibus's job.
+  preserve_omnibus = new_resource.preserve_omnibus
+  if !preserve_omnibus && running_under_omnibus?
+    Chef::Log.warn('chef_client_updater_enterprise_install: preserve_omnibus false ignored while ' \
+                   'chef-client itself runs from the omnibus install; use ' \
+                   'chef_client_updater_enterprise_remove_omnibus to remove it on a later run.')
+    preserve_omnibus = true
+  end
+
+  # True when the target version's Habitat package is already on disk. Nil
+  # pkg_version (download_url with version 'latest') leaves idempotency to the
+  # native package resource below.
+  hab_pkg = new_resource.habitat_package
+  already_current = lambda do
+    pkg_version && hab_pkg_dirs(hab_pkg).any? { |d| hab_dir_version(d) == pkg_version }
+  end
+
   installed_version = current_native_version(new_resource.product_name)
   pkg_action = installed_version.nil? ? :install : :upgrade
-  rhel_family = platform_family?('rhel', 'amazon', 'fedora', 'suse')
-  debian_family = platform_family?('debian')
+  reconverge = 'chef_client_updater_enterprise_scheduler_reconvergence[default]'
 
-  if rhel_family
-    # The habitat-based chef-ice packaging ships its actual payload under
-    # per-version paths (/hab/pkgs/chef/chef-infra-client/<version>/...) that
-    # never collide across releases, plus a handful of small *non-versioned*
-    # convenience files shared by every release (e.g.
-    # /hab/migration/bin/migrate-ice, /hab/migration/bin/CHANGELOG.md).
-    #
-    # A dnf/yum :upgrade transaction (or an :install with
-    # --setopt=installonlypkgs, which still runs file-conflict checks across
-    # every "installed" NEVRA) erases the ENTIRE previous version's directory
-    # tree, including its versioned hab path, as part of installing the new
-    # one. If the chef-client process executing this very converge is itself
-    # running out of that old version's hab tree, its own dnf helper script
-    # gets deleted mid-transaction and the converge crashes with ENOENT.
-    # Meanwhile the non-versioned shared files above are legitimately owned
-    # by every chef-ice release, so straightforward side-by-side installs
-    # collide on those specific paths.
-    #
-    # Bypassing dnf/yum entirely for chef-ice and going straight to `rpm`
-    # (via Chef's built-in rpm_package resource — still a first-class Chef
-    # package resource, not a raw shell-out) solves the multi-version
-    # preservation problem:
-    #   * A plain `rpm -i` never removes a different, already-installed NEVRA
-    #     of the same package name — it just adds a new rpm db entry, so the
-    #     previous version's hab directory is left untouched automatically.
-    #   * rpm itself never processes `Obsoletes:` (that's purely a dnf/yum
-    #     depsolver behavior), so the legacy omnibus `chef` package is never
-    #     at risk of being auto-removed via that mechanism.
-    #   * `--replacefiles` force-overwrites just the handful of shared,
-    #     non-versioned convenience files instead of erroring on the file
-    #     conflict; "latest install wins" for those fixed paths is the
-    #     desired behavior since they aren't part of the versioned hab tree.
-    #
-    # `--noscripts` is essential: chef-ice's own RPM %post scriptlet
-    # unconditionally runs `/hab/migration/bin/migrate-ice apply airgap` on
-    # every single install, with NO `--preserve-omnibus` flag and no hook to
-    # inject one (it only reads a debug-logging env var). That scriptlet is
-    # what actually deletes /opt/chef — dnf/yum obsoletes handling was never
-    # the real culprit. Suppressing the package's own scriptlets and running
-    # migrate-ice ourselves via the `execute` resource below (which DOES pass
-    # `--preserve-omnibus` from the `preserve_omnibus` property) is the only
-    # way to control that behavior. The tarball payload itself is still
-    # extracted normally by rpm — only the scriptlet-driven auto-invocation
-    # of migrate-ice is skipped.
-    rpm_package new_resource.product_name do
-      source pkg_path
-      version pkg_version if pkg_version
-      # `--nodigest` is required on top of `--replacefiles --noscripts`:
-      # chef-ice's published RPMs are missing a modern per-file payload digest.
-      # Whether missing-digest packages are rejected depends entirely on the
-      # installed rpm binary's own default `_pkgverify_level` macro, Fedora 44's
-      # bundled rpm 6.0.2 defaults `_pkgverify_level` to `digest` and hard-fails
-      # with `package ... does not verify: no digest` otherwise. `--nodigest`
-      # disables only this specific payload-digest check.
-      options '--replacefiles --noscripts --nodigest'
-      action :install
-    end
-  elsif debian_family
-    # chef-ice's .deb packaging carries the exact same problem as the RPM:
-    # its `postinst` maintainer script unconditionally invokes
-    # `/hab/migration/bin/migrate-ice apply airgap ...` on every single
-    # install/upgrade, with no flag or hook to inject --preserve-omnibus.
-    # Unlike rpm, dpkg has no `--noscripts` equivalent — `dpkg -i` always
-    # unpacks AND configures (i.e. runs postinst) in a single atomic
-    # operation, so there is no single flag to suppress just the scriptlet.
-    #
-    # Instead we drive dpkg's own two-phase install lifecycle directly:
-    #   1. `dpkg --unpack` extracts the payload (including
-    #      /hab/migration/bin/migrate-ice and the migration tarball under
-    #      /hab/migration/bundle/) and runs `preinst`, but explicitly stops
-    #      short of running `postinst` — the package is left in dpkg's
-    #      "unpacked" state, not yet "installed".
-    #   2. Swap the just-unpacked migrate-ice binary for a no-op stub so
-    #      that when `dpkg --configure` subsequently runs postinst, its
-    #      `eval $MIGRATE_CMD` succeeds trivially instead of performing the
-    #      real (uncontrolled) migration.
-    #   3. `dpkg --configure` completes the postinst lifecycle against the
-    #      stub, moving the package to "install ok installed" in dpkg's own
-    #      database — dpkg itself sees a perfectly normal, successful
-    #      install/upgrade.
-    #   4. Restore the real migrate-ice binary. The platform-agnostic
-    #      `execute 'migrate-ice apply airgap'` resource below then invokes
-    #      it ourselves, passing --preserve-omnibus from the
-    #      preserve_omnibus property.
-    #
-    # Unlike rpm, no --replacefiles-style flag is needed here: dpkg treats
-    # this as a normal same-package upgrade (a single package "slot" per
-    # name), so it freely overwrites its own previously-owned shared files
-    # without any conflict — the RPM conflict only arose because two
-    # *separate* NEVRA entries for the same package name were tracked
-    # simultaneously, a concept dpkg's package database doesn't have (or
-    # need) at all.
-    #
-    # A second, more destructive problem exists purely on the upgrade path
-    # (confirmed live): chef-ice's `postrm` hardcodes the CURRENTLY
-    # installed version number and, on removal, uninstalls that specific
-    # hab package; if that leaves nothing but `core/hab` behind, it runs
-    # `rm -rf /hab` unconditionally. Per dpkg's own documented maintainer
-    # script ordering, upgrading an already-installed package invokes the
-    # OLD package's `postrm upgrade <new-version>` as part of the SAME
-    # `--unpack` step (old-prerm, new-preinst, [unpack new files],
-    # old-postrm) — entirely before dpkg --configure ever runs, so
-    # stubbing migrate-ice ahead of --configure (step 2 below) is too late:
-    # by then the old postrm has already deleted the ENTIRE /hab tree,
-    # including the brand new version's just-unpacked migration payload.
-    # Neutralizing the old package's postrm immediately before --unpack
-    # (only relevant when a prior version is actually installed) closes
-    # this gap. dpkg overwrites this same info file with the NEW package's
-    # own postrm during unpack, so nothing needs to be restored afterward.
-    migrate_ice_bin = '/hab/migration/bin/migrate-ice'
-    migrate_ice_backup = '/hab/migration/bin/migrate-ice.chef-updater-backup'
-    old_postrm = "/var/lib/dpkg/info/#{new_resource.product_name}.postrm"
-    # dpkg has no native "already at this exact version" idempotency check the
-    # way rpm_package/windows_package provide — without this guard, the two
-    # `execute` resources below would unconditionally re-run `dpkg --unpack`/
-    # `--configure` on EVERY converge whenever `version` is 'latest' (the
-    # top-level version guard at the top of this action only short-circuits
-    # for an explicitly pinned, already-installed version).
-    dpkg_already_current = pkg_version && current_native_version(new_resource.product_name) == pkg_version
-
-    # Self-heal: a converge that died between stubbing migrate-ice and restoring
-    # it (an unhandled error elsewhere in the run, a reboot, a SIGKILL) leaves the
-    # real binary parked at migrate_ice_backup. Put it back BEFORE `dpkg --unpack`
-    # runs — restoring afterwards would clobber the newly-unpacked release's
-    # migrate-ice with the previous release's copy. Deliberately NOT guarded by
-    # `dpkg_already_current`: a stranded backup has to be reclaimed regardless of
-    # whether this converge goes on to install anything.
-    ruby_block "restore migrate-ice stranded by an earlier converge (#{pkg_path})" do
-      block do
-        ::FileUtils.mv(migrate_ice_backup, migrate_ice_bin, force: true)
-      end
-      only_if { ::File.exist?(migrate_ice_backup) }
-    end
-
-    ruby_block "neutralize old #{new_resource.product_name} postrm before upgrade (#{pkg_path})" do
-      block do
-        ::File.write(old_postrm, "#!/bin/sh\nexit 0\n")
-        ::FileUtils.chmod(0o755, old_postrm)
-      end
-      only_if { ::File.exist?(old_postrm) }
-      not_if { dpkg_already_current }
-    end
-
-    # --force-conflicts overrides dpkg's declared `Conflicts: chef-workstation-enterprise`
-    # (chef-ice's .deb refuses to unpack at all otherwise when any variant of
-    # chef-workstation-enterprise is present).
-    execute "dpkg --unpack #{pkg_path}" do
-      command "dpkg --force-conflicts --unpack #{pkg_path}"
-      not_if { dpkg_already_current }
-    end
-
-    # Steps 2-4 (stub migrate-ice, `dpkg --configure`, restore migrate-ice) are
-    # deliberately ONE `ruby_block` with a `begin/ensure` rather than three
-    # separately declared Chef resources. Chef has no cross-resource `ensure`:
-    # when `dpkg --configure` fails, the run aborts and any separately-declared
-    # "restore" resource never converges, leaving /hab/migration/bin/migrate-ice
-    # as a permanent `#!/bin/sh exit 0` stub. Every subsequent converge would
-    # then run `execute[migrate-ice apply airgap]` against that stub, which exits
-    # 0 without extracting anything — chef-ice would appear to install
-    # successfully forever while /hab/pkgs stayed empty. Keeping all three phases
-    # in a single block guarantees the real binary is put back even when dpkg
-    # raises, and the exception still propagates and fails the converge.
-    ruby_block "dpkg --configure #{new_resource.product_name} with migrate-ice stubbed (#{pkg_path})" do
-      block do
-        ::FileUtils.mv(migrate_ice_bin, migrate_ice_backup, force: true) if ::File.exist?(migrate_ice_bin)
-        ::File.write(migrate_ice_bin, "#!/bin/sh\nexit 0\n")
-        ::FileUtils.chmod(0o755, migrate_ice_bin)
-
-        begin
-          shell_out!("dpkg --configure #{new_resource.product_name}")
-        ensure
-          ::FileUtils.mv(migrate_ice_backup, migrate_ice_bin, force: true) if ::File.exist?(migrate_ice_backup)
-        end
-      end
-      not_if { dpkg_already_current }
-      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
-    end
-  elsif windows?
-    # Unlike rpm/deb, chef-ice's Windows MSI has no `--noscripts`-equivalent
-    # suppression mechanism available from outside — its own bundled
-    # RunPostInstallFresh/RunPostInstallMigrate custom actions (a PostInstall.ps1
-    # script embedded in the MSI) unconditionally invoke migrate-ice as a deferred
-    # step of the msiexec transaction itself, with no supported way to skip or
-    # replace them short of authoring an MSI transform. Confirmed via direct
-    # inspection of the MSI (Property/CustomAction/InstallExecuteSequence tables,
-    # and the embedded PostInstall.ps1 admin-extracted from the package):
-    #
-    # - ProductCode AND UpgradeCode both differ across chef-ice versions, so
-    #   Windows Installer's own RemoveExistingProducts major-upgrade behavior
-    #   never triggers between chef-ice releases — side-by-side installs of
-    #   different versions are already safe natively, with no rpm/dnf-style
-    #   "obsoletes" collision to work around.
-    # - chef-ice releases built on/after ~2026-04-23 expose a `CHEF_PRESERVE_OMNIBUS`
-    #   MSI property (settable via `options` on the msiexec command line) that the
-    #   embedded PostInstall.ps1 forwards straight to `migrate-ice ... --preserve-omnibus`.
-    #   Releases built before that (e.g. 19.2.12) have no such property at all — their
-    #   PostInstall.ps1 always migrates destructively, and there is no known way to
-    #   make those specific older MSI releases preserve the omnibus install.
-    # - There is no MSI-property equivalent for the license key; PostInstall.ps1 reads
-    #   CHEF_LICENSE_KEY only from the Machine-scoped environment (a live registry
-    #   read, so setting it immediately before the package resource runs is reliable
-    #   even though the Windows Installer service process itself may have started
-    #   long before this converge).
-    # - `TARGETDIR` MUST be pinned to the Windows volume (see WINDOWS_MSI_TARGETDIR
-    #   in libraries/helpers.rb). chef-ice MSIs older than 19.3.15 do not set it
-    #   themselves, so Windows Installer falls back to ROOTDRIVE — the fixed drive
-    #   with the MOST FREE SPACE, which is frequently not C:.
-    #
-    # Freshly-created Windows accounts (e.g. CI's `net user /add` local test
-    # user, or any account that has never interactively logged on) can
-    # inherit a PATH containing literal, unexpanded `%SystemRoot%`-style
-    # tokens from the default user profile template instead of resolved
-    # paths — or, over WinRM, a PATH that omits the Windows system
-    # directories entirely. Mixlib::ShellOut on Windows does a literal
-    # PATH-directory search with no shell-style `%` expansion, so an entry
-    # like `%SystemRoot%\system32` never resolves to `C:\Windows\system32`,
-    # and a PATH missing that directory outright fails the same way: the
-    # `package` resource's `msiexec` invocation below dies with `'msiexec'
-    # is not recognized as an internal or external command` even though
-    # msiexec.exe is right there on disk. Expand any `%VAR%` tokens AND
-    # guarantee the core system directories are present before that resource
-    # runs. Expansion alone is not sufficient — it can only fix entries that
-    # are actually there.
+  if windows?
+    # PowerShell's PostInstall custom action reads CHEF_LICENSE_KEY only from the
+    # environment, so it is set Machine-scoped just for the msiexec run. `:before`
+    # runs windows_package in why-run first and only fires when it would install,
+    # so the key is written only for a real install and removed afterwards.
     repair_windows_path!
 
-    # The Machine-scoped CHEF_LICENSE_KEY env var is the ONLY channel through
-    # which the MSI's embedded PostInstall.ps1 can receive a license key, but it
-    # must not be left behind on disk, and `windows_env` has NO idempotency of
-    # its own: `:create` unconditionally (re)writes the value and `:delete`
-    # unconditionally removes it. Declared with `action :nothing` and driven
-    # exclusively by notifications from the `package` resource below, so the
-    # pair converges only when msiexec actually runs.
-    #
-    # A `:before` notification is what makes this exact: Chef::Runner#run_action
-    # runs the notifying resource in forced why-run FIRST and only fires the
-    # notification when that pass reports the resource as updated. The decision
-    # is therefore delegated wholesale to `windows_package`'s own MSI
-    # ProductCode/version check — no second, independently-derived "is it already
-    # installed?" guard to drift out of sync with it. An earlier version compared
-    # a registry DisplayVersion scraped by PowerShell against the API-advertised
-    # version; whenever those two strings disagreed the pair reported 2 updated
-    # resources on every converge forever.
-    windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install' do
-      key_name 'CHEF_LICENSE_KEY'
-      value new_resource.license_key
-      sensitive true
-      action :nothing
+    # license_key is nil on the download_url path; windows_env rejects a nil value
+    # even with action :nothing, so stage it only when there is a key.
+    license_env = 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]' if new_resource.license_key
+    if license_env
+      windows_env 'CHEF_LICENSE_KEY for chef-ice MSI install' do
+        key_name 'CHEF_LICENSE_KEY'
+        value new_resource.license_key
+        sensitive true
+        action :nothing
+      end
     end
 
-    # `TARGETDIR` pins the install root to the Windows volume. Only chef-ice
-    # 19.3.15+ carries its own `SetTARGETDIR = [WindowsVolume]` custom action;
-    # on older MSIs Windows Installer resolves TARGETDIR from ROOTDRIVE — the
-    # fixed drive with the most free space. On a GitHub Actions Windows runner
-    # (C: ~35GB free, D: ~145GB free) that is D:, so the payload lands in
-    # `D:\hab` while the MSI's own PostInstall.ps1 still shells out to the
-    # hardcoded `C:\hab\migration\bin\migrate-ice.exe`, which then does not
-    # exist — msiexec dies with a bare exit 1603 and no diagnostic. Every path
-    # helper in this cookbook (Helpers#hab_pkg_root,
-    # Helpers#chef_client_binlink_dir) also assumes `C:\hab`, so an install
-    # anywhere else is unusable here even when msiexec reports success.
+    # TARGETDIR pins the install root to C:\ (see WINDOWS_MSI_TARGETDIR).
     msi_options = ["TARGETDIR=#{ChefClientUpdaterEnterprise::Helpers::WINDOWS_MSI_TARGETDIR}"]
-    msi_options << 'CHEF_PRESERVE_OMNIBUS=1' if new_resource.preserve_omnibus
+    msi_options << 'CHEF_PRESERVE_OMNIBUS=1' if preserve_omnibus
+    msi_options << 'CHEF_SKIP_BINLINKING=1' unless new_resource.manage_binlinks
+    # Old releases stay until `cleanup`; the installer must not remove them.
+    msi_options << 'CHEF_SKIP_OLD_RELEASE_REMOVAL=1'
 
-    package new_resource.product_name do
+    win_pkg = windows_package new_resource.product_name do
       source pkg_path
       version pkg_version if pkg_version
       installer_type :msi
       options msi_options.join(' ')
-      action :install
-      # The embedded PostInstall.ps1 custom action runs migrate-ice
-      # synchronously as part of the msiexec transaction, which can easily
-      # exceed windows_package's 600s (10 min) default timeout — observed
-      # taking ~7-13 minutes live. msiexec itself keeps running to
-      # completion regardless (Chef's shell_out just stops waiting and
-      # raises), so a short timeout here only produces a false failure.
+      # The MSI runs migrate-ice inside the transaction: 7-13 minutes observed.
       timeout 1800
-      notifies :create, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :before
-      notifies :delete, 'windows_env[CHEF_LICENSE_KEY for chef-ice MSI install]', :delayed
-      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
+      action :install
+      if license_env
+        notifies :create, license_env, :before
+        notifies :delete, license_env, :delayed
+      end
+      notifies :reconverge, reconverge, :delayed
+    end
+
+    # Same failure mode as RPM/DEB: the MSI stays registered when migrate-ice
+    # left the release incomplete, so windows_package reports "up to date".
+    # Reinstall the same MSI in maintenance mode. Properties must be passed on
+    # an /i REINSTALL=ALL command line; `msiexec /fa` dropped them in testing
+    # and migrate-ice then removed older releases. A ProductCode-only repair
+    # failed (1706, source not found) once the original MSI was gone.
+    if pkg_version
+      repair_needed = lambda do
+        !win_pkg.updated_by_last_action? && !already_current.call && native_version_installed?(new_resource.product_name, pkg_version)
+      end
+      # Windows Installer accepts a maintenance install only from a package with
+      # the file name it recorded at install time (SourceList PackageName);
+      # another name fails SecureRepair with 1603. Stage the downloaded MSI under
+      # that name next to it. `v` re-caches the package from this source.
+      repair_msi = Chef::DelayedEvaluator.new do
+        name = windows_msi_package_name(new_resource.product_name, pkg_version)
+        # File names are case-insensitive on Windows: same name means no copy.
+        name && !name.casecmp?(::File.basename(pkg_path)) ? ::File.join(::File.dirname(pkg_path), name) : pkg_path
+      end
+      remote_file "stage #{new_resource.product_name} #{pkg_version} MSI for repair" do
+        path repair_msi
+        source lazy { "file:///#{pkg_path.tr('\\', '/')}" }
+        only_if { repair_needed.call && repair_msi.call(self) != pkg_path }
+      end
+
+      win_log = ::File.join(new_resource.download_dir, "#{new_resource.product_name}-#{pkg_version}-repair.log").tr('/', '\\')
+      execute "reinstall #{new_resource.product_name} #{pkg_version}" do
+        command(lazy { "msiexec.exe /i \"#{repair_msi.call(self).tr('/', '\\')}\" REINSTALL=ALL REINSTALLMODE=vamus #{msi_options.join(' ')} /qn /norestart /l*v \"#{win_log}\"" })
+        returns [0, 3010]
+        timeout 1800
+        only_if { repair_needed.call }
+        if license_env
+          notifies :create, license_env, :before
+          notifies :delete, license_env, :delayed
+        end
+        notifies :reconverge, reconverge, :delayed
+      end
     end
   else
-    package new_resource.product_name do
-      source pkg_path
-      version pkg_version if pkg_version
-      action pkg_action
-      notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
+    # The rpm/deb/dmg post-install scripts read their settings from /tmp/chef_env
+    # (root-owned, not group/world writable; parsed, never sourced) and delete it on
+    # exit whatever the outcome. It is written only via a `:before` notification, so
+    # it exists only when the package resource is actually about to install.
+    env_lines = []
+    env_lines << "CHEF_PRESERVE_OMNIBUS=#{preserve_omnibus}"
+    env_lines << "CHEF_SKIP_BINLINKING=#{!new_resource.manage_binlinks}"
+    # Old releases stay until `cleanup`; the installer must not remove them.
+    env_lines << 'CHEF_SKIP_OLD_RELEASE_REMOVAL=true'
+    env_lines << "CHEF_FSTAB=#{new_resource.fstab_handling}" unless platform?('mac_os_x')
+    env_lines << "CHEF_LICENSE_KEY=#{new_resource.license_key}" if new_resource.license_key
+
+    file ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE do
+      content "#{env_lines.join("\n")}\n"
+      owner 'root'
+      group 0
+      mode '0600'
+      sensitive true
+      action :nothing
+    end
+    chef_env = "file[#{ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE}]"
+
+    if platform?('mac_os_x')
+      unless pkg_version
+        raise Chef::Exceptions::ValidationFailed,
+              'chef_client_updater_enterprise_install: an explicit version is required with ' \
+              'download_url on macOS (the dmg volume is named after it).'
+      end
+
+      # dmg_package's own idempotency checks a .app or an unversioned pkgutil receipt,
+      # neither of which tells chef-ice releases apart, so the Habitat package
+      # directory is the guard.
+      dmg_package "#{new_resource.product_name}-#{pkg_version}" do
+        file pkg_path
+        type 'pkg'
+        volumes_dir "Chef Infra Client #{pkg_version}"
+        not_if { already_current.call }
+        notifies :create, chef_env, :before
+        notifies :delete, chef_env, :delayed
+        notifies :reconverge, reconverge, :delayed
+      end
+    elsif platform_family?('debian')
+      deb_pkg = dpkg_package new_resource.product_name do
+        source pkg_path
+        version pkg_version if pkg_version
+        action pkg_action
+        not_if { already_current.call }
+        notifies :create, chef_env, :before
+        notifies :delete, chef_env, :delayed
+        notifies :reconverge, reconverge, :delayed
+      end
+
+      # Same failure mode as RPM below: dpkg records the version even when
+      # postinst (migrate-ice) failed, and dpkg_package then reports "up to
+      # date". `dpkg -i` of the same .deb re-runs postinst configure, and
+      # migrate-ice re-extracts the exact incomplete target release.
+      if pkg_version
+        execute "reinstall #{new_resource.product_name} #{pkg_version}" do
+          command ['dpkg', '-i', pkg_path]
+          environment('DEBIAN_FRONTEND' => 'noninteractive')
+          only_if { !deb_pkg.updated_by_last_action? && !already_current.call && native_version_installed?(new_resource.product_name, pkg_version) }
+          notifies :create, chef_env, :before
+          notifies :delete, chef_env, :delayed
+          notifies :reconverge, reconverge, :delayed
+        end
+      end
+    else
+      # rpm_package works on every rpm platform family (dnf/yum/zypper alike) from a
+      # local file. chef-ice's %preun only acts on a full erase, so an upgrade
+      # leaves the previous version's /hab/pkgs directory in place.
+      rpm_pkg = rpm_package new_resource.product_name do
+        source pkg_path
+        version pkg_version if pkg_version
+        action pkg_action
+        not_if { already_current.call }
+        notifies :create, chef_env, :before
+        notifies :delete, chef_env, :delayed
+        notifies :reconverge, reconverge, :delayed
+      end
+
+      # rpm records a package even when its %post (migrate-ice) fails, so a
+      # failed migration leaves rpm reporting the target version while no
+      # release with IDENT exists under /hab/pkgs. rpm_package then reports
+      # "up to date" forever (Chef's package provider short-circuits on an
+      # installed version match), so reinstall the same file explicitly in
+      # exactly that state. --replacepkgs re-runs %post; migrate-ice removes the
+      # exact incomplete target release directory (no IDENT) and retries. If it
+      # still fails, the verification below fails the converge.
+      if pkg_version
+        execute "reinstall #{new_resource.product_name} #{pkg_version}" do
+          command ['rpm', '-U', '--replacepkgs', pkg_path]
+          only_if { !rpm_pkg.updated_by_last_action? && !already_current.call && native_version_installed?(new_resource.product_name, pkg_version) }
+          notifies :create, chef_env, :before
+          notifies :delete, chef_env, :delayed
+          notifies :reconverge, reconverge, :delayed
+        end
+      end
     end
   end
 
-  # Run migrate-ice ourselves after package install to populate the /hab/pkgs
-  # tree, now that the RPM's own %post scriptlet is suppressed (--noscripts
-  # above). We pick the most-recently-extracted tarball by mtime rather than
-  # just globbing "the first match" — with scriptlets suppressed, nothing
-  # ever cleans up older versions' tarballs out of /hab/migration/bundle, so
-  # multiple can accumulate there once several chef-ice versions have been
-  # installed side by side. The one from *this* rpm transaction is always
-  # the newest on disk.
-  #
-  # `--fresh-install` is passed CONDITIONALLY, based on whether `chef-client` currently
-  # resolves via $PATH (see `chef_client_on_path?` in libraries/helpers.rb). This mirrors
-  # migrate-ice's OWN internal detection exactly:
-  #
-  # - When chef-client IS on $PATH (true for every native OS package install of omnibus
-  #   Chef — /usr/bin, /opt/chef/bin symlinked in, etc. — so this is the common case on
-  #   real VMs/EC2), migrate-ice's non-fresh-install path runs a normal, correctly-behaved
-  #   migration: it detects the existing version, extracts the bundle, populates
-  #   /hab/pkgs, and fully respects --preserve-omnibus (confirmed live: with
-  #   --preserve-omnibus true and /opt/chef NOT a mount point it logs "/opt/chef is not
-  #   mounted. Skipping --fstab flag handling." and leaves /opt/chef untouched). When
-  #   /opt/chef IS its own mount point, this path additionally performs --fstab handling,
-  #   which must be suppressed — see the --fstab paragraph below.
-  # - When chef-client is NOT on $PATH (normal for minimal Dokken/CI container images that
-  #   invoke the bootstrap chef-client by full path rather than via $PATH), the
-  #   non-fresh-install path's own "is chef-client installed?" check fails and it silently
-  #   no-ops (exit 0, nothing extracted, /hab/pkgs never populated) — so `--fresh-install`
-  #   is required there instead, to skip that check entirely and just extract the bundle
-  #   unconditionally.
-  #
-  # `--fstab <apply|fail|ignore>` (migrate-ice's own default: `apply`) is passed explicitly on
-  # the migration path from the `fstab_handling` property, which itself defaults to `ignore`
-  # whenever `preserve_omnibus` is true. `apply` means "take the block device currently mounted
-  # at /opt/chef and remount it at /hab", which is actively wrong when we are preserving the
-  # omnibus install — and it doesn't degrade gracefully, it hard-fails the whole migration
-  # (confirmed live):
-  #
-  #     [INFO] /opt/chef is mounted on device <dev>. Proceeding with migration.
-  #     Failure while processing flag `fstab`, Error: error during mount migration:
-  #       failed to mount <dev> to /hab: exit status 32.
-  #     chef-client migration failed. ... Initiating rollback...
-  #
-  # migrate-ice then rolls back, so nothing is installed and the `execute` exits non-zero.
-  # This is NOT a rare edge case: every kitchen-dokken container has /opt/chef bind-mounted
-  # in from the `chef/chef` data container, so ANY converge that reaches the migration path
-  # there fails 100% of the time (this is what broke the multi-version suite on every Linux
-  # platform — the FIRST install takes the --fresh-install path, which never touches fstab,
-  # but it binlinks chef-client onto $PATH, so the SECOND install in the same converge takes
-  # the migration path and dies). It is equally reachable on real customer systems that keep
-  # /opt/chef on a dedicated filesystem.
-  #
-  # The flag is only appended on the migration path: the --fresh-install path does not process
-  # fstab at all (it isn't in that path's validated-flag set), so passing it there would be
-  # dead weight.
-  #
-  # --process-config ignore skips the running-process check so kitchen converge
-  # does not get blocked by the in-flight chef-client process.
-  license = new_resource.license_key
-  execute 'migrate-ice apply airgap' do
-    command lazy {
-      bundle = ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').max_by { |f| ::File.mtime(f) }
-      preserve_flag = new_resource.preserve_omnibus ? ' --preserve-omnibus true' : ''
-      fresh_install = !chef_client_on_path?
-      fresh_flag = fresh_install ? ' --fresh-install' : ''
-      fstab_flag = fresh_install ? '' : " --fstab #{new_resource.fstab_handling}"
-      license_flag = new_resource.license_key ? " --license-key #{new_resource.license_key}" : ''
-      "/hab/migration/bin/migrate-ice apply airgap #{bundle} --process-config ignore #{license_flag}#{preserve_flag}#{fresh_flag}#{fstab_flag}"
-    }
-    environment lazy { hab_env.merge('CHEF_LICENSE_KEY' => license.to_s) }
-    sensitive true
-    only_if { ::File.exist?('/hab/migration/bin/migrate-ice') }
-    only_if { ::Dir.glob('/hab/migration/bundle/chef-ice-*.tar.gz').any? }
-    retries 5
-    retry_delay 10
-    not_if { pkg_version && hab_pkg_dirs(new_resource.habitat_package).any? { |d| d.split('/')[-2] == pkg_version } }
-    notifies :reconverge, 'chef_client_updater_enterprise_scheduler_reconvergence[default]', :delayed
+  # Native installers can report success after migrate-ice failed (rpm only
+  # warns on a failing %post). Fail the converge if the expected release is
+  # not on disk with an IDENT. This proves the release was unpacked, not that
+  # every migration step succeeded. Skipped when the version is unknown
+  # (download_url with version 'latest').
+  if pkg_version
+    ruby_block "verify #{hab_pkg} #{pkg_version} release" do
+      block do
+        raise "chef_client_updater_enterprise_install: #{new_resource.product_name} #{pkg_version} " \
+              "was installed but no #{hab_pkg} #{pkg_version} release with an IDENT file exists under " \
+              "#{hab_pkg_root(hab_pkg)}. The migration did not complete; see the migrate-ice log " \
+              '(/var/log/chef-hab-migrate.log; on Windows %TEMP%\\chef-migration-logs\\chef-hab-migrate.log ' \
+              'and C:\\ProgramData\\Chef\\Logs\\chef-infra-install.log).'
+      end
+      not_if { already_current.call }
+    end
   end
+
+  # Remove a settings file left behind by an earlier failed run. Declared after
+  # the package step, so the installer has already consumed it.
+  file "remove stale #{ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE}" do
+    path ChefClientUpdaterEnterprise::Helpers::CHEF_ENV_FILE
+    action :delete
+    sensitive true
+  end unless windows?
 
   unless windows? || hab_binary
     link '/bin/hab' do

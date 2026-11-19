@@ -6,6 +6,15 @@ Installs and manages Chef Infra Client via `chef-ice` native OS packages resolve
 
 Chef Infra Client >= 17.0 (required for the `use` partial DSL).
 
+chef-ice releases **newer than 19.4.50** on Linux (rpm/deb), macOS (dmg) and Windows (msi). Older
+releases are refused before anything is installed. The version you migrate from (any omnibus Chef
+Infra Client) does not matter. With `download_url` and `version 'latest'` the version is unknown and
+the check is skipped; on macOS `download_url` needs an explicit `version`.
+
+> **Release blocker:** the newest `stable` chef-ice is currently 19.4.46, so the default (`stable`,
+> `latest`) install is refused until a newer stable build ships. The test cookbook temporarily uses
+> the `current` channel (19.4.56).
+
 ## Resources
 
 - [chef_client_updater_enterprise_install](documentation/resources/install.md)
@@ -22,13 +31,26 @@ Set the `CHEF_LICENSE_KEY` environment variable on your nodes, then use the inst
 chef_client_updater_enterprise_install 'default'
 ```
 
-`CHEF_LICENSE_KEY` must be exported wherever the converge actually runs `migrate-ice` (Test Kitchen
-drivers, CI runners, production nodes) — the `install` resource's `license_key` property defaults
-to reading it from the environment, and `migrate-ice apply airgap` fails without a valid key.
+`CHEF_LICENSE_KEY` must be exported wherever the converge runs (Test Kitchen drivers, CI runners,
+production nodes) — the `install` resource's `license_key` property defaults to reading it from the
+environment, and the installer's migration fails without a valid key.
 
-This downloads the latest stable `chef-ice` package, installs it via the native package manager
-(rpm/deb/msi, preserving any previously installed `chef-ice` version and the legacy omnibus
-install), and creates Habitat binlinks. The running `chef-client` process is **not** re-executed or
+This downloads the latest stable `chef-ice` package and installs it with the native installer
+(`rpm_package`, `dpkg_package`, `dmg_package` or `windows_package`), which runs the migration itself,
+preserving any previously installed `chef-ice` version and the legacy omnibus install, and creates
+Habitat binlinks. Installer settings are passed via `/tmp/chef_env` (root-only, deleted by the
+installer) on Linux/macOS and MSI properties on Windows.
+
+To leave binlinking entirely to you (the installer is told to skip it too):
+
+```ruby
+chef_client_updater_enterprise_install 'default' do
+  manage_binlinks false
+end
+```
+
+`preserve_omnibus false` is ignored, with a warning, while chef-client itself runs from the omnibus
+install; use `chef_client_updater_enterprise_remove_omnibus` on a later run instead. The running `chef-client` process is **not** re-executed or
 replaced — the new client takes effect on the next chef-client run. If the node has a
 `chef_client_cron`/`chef_client_launchd`/`chef_client_systemd_timer`/`chef_client_scheduled_task`
 schedule declared, the install resource repoints it at the newly installed client so that next

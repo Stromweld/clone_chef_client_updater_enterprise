@@ -17,6 +17,8 @@ describe 'chef_client_updater_enterprise_cleanup' do
     allow(::File).to receive(:directory?).with(root).and_return(true)
     allow(::Dir).to receive(:glob).with("#{root}/*/*").and_return(dirs)
     dirs.each { |d| allow(::File).to receive(:directory?).with(d).and_return(true) }
+    allow(::File).to receive(:file?).and_call_original
+    dirs.each { |d| allow(::File).to receive(:file?).with("#{d}/IDENT").and_return(true) }
   end
 
   def stub_running_ident(gem_path)

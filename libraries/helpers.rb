@@ -67,6 +67,29 @@ module ChefClientUpdaterEnterprise
     # space — which is not necessarily the Windows volume.
     WINDOWS_MSI_TARGETDIR = 'C:\\'
 
+    # Settings file read (parsed, never sourced) and then deleted by the chef-ice
+    # rpm/deb/dmg post-install script. Must be root-owned and not group/world writable.
+    CHEF_ENV_FILE = '/tmp/chef_env'
+
+    # Newest chef-ice release WITHOUT the installer fixes (settings via /tmp/chef_env
+    # or MSI properties, --skip-binlinking, side-by-side upgrades). Only newer
+    # releases are supported.
+    LAST_UNSUPPORTED_CHEF_ICE_VERSION = '19.4.50'
+
+    # macOS pkgutil receipt ids per native package name. Receipt ids are not derived
+    # from the package name: chef-ice's DMG registers `io.chef.chef-ice.core`
+    # (build-infra-dmg.sh --identifier) and omnibus Chef registers
+    # `com.getchef.pkg.chef` (`com.chef.chef` kept as a legacy fallback).
+    MACOS_PKG_RECEIPTS = {
+      'chef-ice' => %w(io.chef.chef-ice.core),
+      'chef' => %w(com.getchef.pkg.chef com.chef.chef),
+    }.freeze
+
+    # Receipt ids to try for a native package name on macOS.
+    def macos_pkg_receipts(pkg_name)
+      MACOS_PKG_RECEIPTS.fetch(pkg_name) { ["com.chef.#{pkg_name}"] }
+    end
+
     # Returns the full path to the hab binary, or nil if not found.
     def hab_binary
       if windows?
@@ -189,17 +212,31 @@ module ChefClientUpdaterEnterprise
     # Returns a sorted array of VERSION/RELEASE subdirectory paths under hab_pkg_root(pkg).
     # Sorted by basename (release timestamps are monotonically increasing).
     # Returns an empty array if the root directory does not exist.
+    #
+    # Only release directories containing an IDENT file count. A release
+    # directory without IDENT is a partial or failed unpack: it is not treated
+    # as installed (so install retries / fails loudly), and because cleanup
+    # enumerates through here it is never deleted by this cookbook either.
+    # A symlinked IDENT does not count (same rule as migrate-ice's os.Lstat).
     def hab_pkg_dirs(pkg)
       root = hab_pkg_root(pkg)
       return [] unless ::File.directory?(root)
 
-      ::Dir.glob("#{root}/*/*").select { |d| ::File.directory?(d) }.sort_by { |d| ::File.basename(d) }
+      ::Dir.glob("#{root}/*/*")
+           .select { |d| ::File.directory?(d) && regular_ident?(::File.join(d, 'IDENT')) }
+           .sort_by { |d| ::File.basename(d) }
     end
 
     # Extracts the VERSION component (second-to-last path segment) from a
     # hab_pkg_dirs-style directory path (.../ORIGIN/NAME/VERSION/RELEASE).
     def hab_dir_version(dir)
       dir.split('/')[-2]
+    end
+
+    # True only for a regular IDENT file; a symlink, directory or missing
+    # path does not count.
+    def regular_ident?(path)
+      !::File.symlink?(path) && ::File.file?(path)
     end
 
     # Builds the full 'origin/name/version/release' ident string for a directory
@@ -388,6 +425,39 @@ module ChefClientUpdaterEnterprise
 
     # Returns the currently installed native package version, or nil if not installed.
     # Uses platform-appropriate package query tools.
+    # True when the native package manager records exactly `version` of
+    # pkg_name (rpm's VERSION field; release is not compared).
+    def native_version_installed?(pkg_name, version)
+      !version.nil? && current_native_version(pkg_name) == version
+    end
+
+    # File name Windows Installer recorded for the installed MSI of exactly
+    # `version` (SourceList PackageName), or nil when there is not exactly one
+    # match. A maintenance install is accepted only from a package with that
+    # name; any other name fails SecureRepair with 1603.
+    def windows_msi_package_name(pkg_name, version)
+      return unless windows? && version
+
+      # Single-quoted PowerShell literals: double any embedded quote.
+      ps_name = pkg_name.to_s.gsub("'", "''")
+      ps_ver = version.to_s.gsub("'", "''")
+      script = <<~PS1
+        $paths = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+                 'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'
+        $codes = @(Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName -like ('*' + [WildcardPattern]::Escape('#{ps_name}') + '*') -and $_.DisplayVersion -eq '#{ps_ver}' -and $_.PSChildName -match '^{[0-9A-Fa-f-]{36}}$' } |
+          ForEach-Object { $_.PSChildName } | Sort-Object -Unique)
+        if ($codes.Count -ne 1) { exit 1 }
+        (New-Object -ComObject WindowsInstaller.Installer).ProductInfo($codes[0], 'PackageName')
+      PS1
+      cmd = Mixlib::ShellOut.new(['powershell.exe', '-NoProfile', '-Command', script], timeout: 30)
+      cmd.run_command
+      return unless cmd.exitstatus.zero?
+
+      name = cmd.stdout.strip
+      name.match?(%r{\A[^\\/:*?"<>|]+\.msi\z}i) ? name : nil
+    end
+
     def current_native_version(pkg_name)
       if platform_family?('debian')
         cmd = Mixlib::ShellOut.new("dpkg-query -W -f='${Version}' #{pkg_name}", timeout: 15)
@@ -404,12 +474,15 @@ module ChefClientUpdaterEnterprise
         ver = cmd.stdout.strip
         (ver.empty? || ver.include?('not installed')) ? nil : ver
       elsif platform?('mac_os_x')
-        cmd = Mixlib::ShellOut.new("pkgutil --pkg-info com.chef.#{pkg_name} 2>/dev/null", timeout: 15)
-        cmd.run_command
-        return unless cmd.exitstatus.zero?
+        macos_pkg_receipts(pkg_name).each do |receipt|
+          cmd = Mixlib::ShellOut.new('pkgutil', '--pkg-info', receipt, timeout: 15)
+          cmd.run_command
+          next unless cmd.exitstatus.zero?
 
-        line = cmd.stdout.lines.find { |l| l.start_with?('version:') }
-        line ? line.split(':').last.strip : nil
+          line = cmd.stdout.lines.find { |l| l.start_with?('version:') }
+          return line.split(':', 2).last.strip if line
+        end
+        nil
       elsif windows?
         # chef-ice's MSI registers DisplayName as "Chef Infra (air-gapped) - chef-ice",
         # not the bare product name — match on substring rather than exact equality.
@@ -474,11 +547,22 @@ module ChefClientUpdaterEnterprise
       end
     end
 
-    # Returns true if `chef-client` resolves via $PATH
-    def chef_client_on_path?
-      exe = windows? ? 'chef-client.bat' : 'chef-client'
-      path_dirs = ENV['PATH'].to_s.split(::File::PATH_SEPARATOR)
-      path_dirs.any? { |dir| ::File.executable?(::File.join(dir, exe)) }
+    # Raises unless `version` is newer than LAST_UNSUPPORTED_CHEF_ICE_VERSION.
+    def unsupported_chef_ice_version!(version)
+      # Chef::Exceptions::ValidationFailed is itself an ArgumentError, so only the
+      # parse is guarded here.
+      parsed = begin
+                 Gem::Version.new(version)
+               rescue ArgumentError
+                 raise Chef::Exceptions::ValidationFailed,
+                       "chef_client_updater_enterprise_install: '#{version}' is not a valid chef-ice version."
+               end
+      return if parsed > Gem::Version.new(LAST_UNSUPPORTED_CHEF_ICE_VERSION)
+
+      raise Chef::Exceptions::ValidationFailed,
+            "chef_client_updater_enterprise_install: chef-ice #{version} is not supported; " \
+            "releases up to #{LAST_UNSUPPORTED_CHEF_ICE_VERSION} predate the installer fixes " \
+            'this cookbook relies on. Install a newer release.'
     end
 
     # Repairs the current process's PATH on Windows so that plain executable

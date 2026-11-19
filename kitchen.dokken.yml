@@ -3,7 +3,6 @@ driver:
   name: dokken
   privileged: true
   chef_image: chef/chef
-  platform: linux/amd64 # TEMP-LOCAL-TESTING-ONLY: force x86_64 on arm64 host; revert before commit
 
 transport:
   name: dokken

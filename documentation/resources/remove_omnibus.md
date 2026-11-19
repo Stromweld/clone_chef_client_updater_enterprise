@@ -45,8 +45,9 @@ Introduced: v0.1.0
   entry is found, the step is skipped with an informational log message.
 - **Linux (all families):** Chef's built-in `package` resource with `action :remove`, so removal is
   idempotent and reports up-to-date correctly. Failures are ignored.
-- **macOS:** Runs `pkgutil --forget com.chef.chef` only if that package receipt is currently
-  registered.
+- **macOS:** Runs `pkgutil --forget` for each omnibus receipt that is currently registered —
+  `com.getchef.pkg.chef` (what omnibus Chef actually registers) and the legacy `com.chef.chef`.
+  chef-ice's own receipt (`io.chef.chef-ice.core`) is never touched.
 - Any other platform: no package-manager removal step is run (directory removal still applies if
   `remove_directories` is `true`).
 

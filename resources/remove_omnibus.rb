@@ -84,18 +84,10 @@ action :remove do
     end
   elsif platform_family?('debian')
     # A plain `package`/`apt_package action :remove` (i.e. `apt-get remove`)
-    # refuses outright here with exit 100 ("Unmet dependencies") — chef-ice
-    # was unpacked with `--force-conflicts` (see install.rb) to override its
-    # declared `Conflicts: chef-workstation-enterprise`, but that override
-    # only lifted the block on INSTALLING chef-ice; it did nothing to the
-    # dependency graph apt still sees for the legacy omnibus `chef` package,
-    # which apt refuses to touch while that unresolved conflict exists on
-    # the box. `dpkg_package`'s `options` property passes straight through
-    # to the dpkg invocation, so `--force-depends` bypasses apt's dependency
-    # resolver entirely (the same category of override `install.rb` already
-    # applies on the install side via rpm_package/dpkg --force-conflicts),
-    # matching the pattern documented in AGENTS.md for this same conflict.
-    # dpkg_package still uses Chef's own `dpkg-query`-backed idempotency
+    # can refuse with exit 100 ("Unmet dependencies") when apt sees an
+    # unresolved dependency graph on the box (for example a host that also
+    # carries chef-workstation). `--force-depends` makes dpkg remove the legacy
+    # omnibus package regardless. dpkg_package still uses Chef's own `dpkg-query`-backed idempotency
     # check (unlike the Habitat-package case in cleanup.rb, dpkg's notion of
     # "installed" is exactly what's wanted here), so this stays a first-class
     # Chef resource rather than a hand-rolled `execute`.
@@ -110,9 +102,14 @@ action :remove do
       ignore_failure true
     end
   elsif platform?('mac_os_x')
-    # Forget pkg receipts on macOS so future installs don't collide
-    execute 'pkgutil --forget com.chef.chef' do
-      only_if { shell_out('pkgutil --pkg-info com.chef.chef').exitstatus.zero? }
+    # Forget the omnibus pkg receipt(s) on macOS so future installs don't collide.
+    # Omnibus registers com.getchef.pkg.chef, not a name derived from the package
+    # (see Helpers::MACOS_PKG_RECEIPTS). chef-ice's own receipt is never touched.
+    macos_pkg_receipts(new_resource.legacy_omnibus_package).each do |receipt|
+      execute "pkgutil --forget #{receipt}" do
+        command ['pkgutil', '--forget', receipt]
+        only_if { shell_out('pkgutil', '--pkg-info', receipt).exitstatus.zero? }
+      end
     end
   end
 
